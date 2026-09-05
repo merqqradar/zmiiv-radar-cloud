@@ -547,7 +547,19 @@ class Radar:
                     silent_enough = quiet > timedelta(
                         minutes=config.CLEAR_AFTER_MIN)
                     if city_gone or silent_enough:
-                        await self._announce(format_gone(self.active_threat, ""))
+                        if city_gone:
+                            # Явний сигнал — повідомлення так і мусить
+                            # казати «не фіксується», а не «канали
+                            # замовкли»: це різні речі, і радар не має
+                            # права видавати одне за інше.
+                            src = self.review.get("city_gone_link")
+                            msg = format_gone(
+                                self.active_threat,
+                                self.review.get("city_gone_wording", ""),
+                                self.review.get("city_gone_text", ""), src)
+                        else:
+                            msg = format_gone(self.active_threat, "")
+                        await self._announce(msg)
                         log.info("загроза знята за смарт-перевіркою (кнопка, "
                                 "%s)", "явне «не фіксується»" if city_gone
                                 else f"мовчання {config.CLEAR_AFTER_MIN} хв")
@@ -575,7 +587,9 @@ class Radar:
                 "top": None, "top_when": None, "top_link": None,
                 "top_gone": False,
                 "oblast_link": None, "oblast_when": None,
-                "city_last_seen": None, "city_gone": False}
+                "city_last_seen": None, "city_gone": False,
+                "city_gone_wording": "", "city_gone_text": "",
+                "city_gone_link": None}
         if not self.client:
             return data
 
@@ -602,6 +616,10 @@ class Radar:
         # момент, коли доходимо до самого допису про загрозу, «зняття»
         # цього ж каналу вже потрапило в gone_channels.
         gone_channels = set()
+        # Найсвіжіший сигнал зняття, чий власний контекст (те, на що він
+        # відповідає) сам згадує головне місто — див. пояснення нижче
+        # біля city_gone.
+        city_gone_evidence = None
 
         for channel in config.CHANNELS:
             ok_channel = False
@@ -613,8 +631,23 @@ class Radar:
                         continue
                     data["messages"] += 1
 
-                    if classify.threat_gone(msg.text, ""):
+                    # threat_gone сам перевіряє релевантність контексту
+                    # (Зміїв / ближній круг / район) і відкидає «не
+                    # фіксується», що насправді стосується вже іншого
+                    # села, куди ціль встигла піти (Безлюдівка,
+                    # Покотилівка...) до цього допису. Раніше тут
+                    # передавався порожній контекст, і ця перевірка
+                    # мовчки пропускалась — саме тому «не фіксується» про
+                    # зовсім інше село помилково знімало загрозу місту.
+                    reply_ctx = getattr(msg, "reply_text", None) or ""
+                    gone_hit = classify.threat_gone(msg.text, reply_ctx)
+                    if gone_hit:
                         gone_channels.add(channel)
+                        if (city_gone_evidence is None
+                                or msg.date > city_gone_evidence[4]):
+                            city_gone_evidence = (
+                                gone_hit[0], msg.text, channel, msg.id,
+                                msg.date)
 
                     res = classify.classify(msg.text)
                     if res and res["level"] in ("HIGH", "MEDIUM"):
@@ -679,11 +712,15 @@ class Radar:
             if ok_channel:
                 data["channels"] += 1
 
-        # Канал, що згадав ціль по місту, а потім сам написав «не
-        # фіксується» / «не спостерігається» про неї — явне підтвердження
-        # зняття. Свіжість цієї ж згадки (city_last_seen) тут не має
-        # значення: сам факт «не фіксується» важливіший за час.
-        data["city_gone"] = bool(gone_channels & threat_channels)
+        # Явне підтвердження зняття рахуємо, лише якщо його власний
+        # контекст сам згадує місто (city_gone_evidence) — інакше це
+        # могло стосуватись іншого села, куди ціль устигла піти.
+        if city_gone_evidence:
+            wording, text, channel, msg_id, _when = city_gone_evidence
+            data["city_gone"] = True
+            data["city_gone_wording"] = wording
+            data["city_gone_text"] = text
+            data["city_gone_link"] = (channel, f"https://t.me/{channel}/{msg_id}")
 
         log.info("огляд: канали %d, повідомлень %d, загроз %d",
                  data["channels"], data["messages"], data["threats"])
@@ -969,6 +1006,9 @@ class Radar:
                 log.info("gone-сигнал від %s, але active_threat вже порожній "
                          "— пропускаю", username)
         if config.CLEAR_THREAT and self.active_threat:
+            # classify.threat_gone сам перевіряє релевантність контексту
+            # (Зміїв / ближній круг / район) — цього досить, не треба
+            # дублювати перевірку тут ще раз.
             gone = classify.threat_gone(text, context)
             if gone:
                 other_region = geo.mentions_other_region(text.lower())

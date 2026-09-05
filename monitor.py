@@ -739,7 +739,14 @@ class Radar:
         """
         while True:
             await asyncio.sleep(60)
-            await self._standby_tick()
+            try:
+                await self._standby_tick()
+            except Exception:                                # noqa: BLE001
+                # КРИТИЧНО: це саме той цикл, що вмикає резерв при збої
+                # онлайну. Якщо він сам колись впаде без цього захисту —
+                # аварійне перемикання просто перестане працювати,
+                # непомітно для будь-кого.
+                log.exception("_standby_tick впав — пропускаю цю перевірку")
 
     async def _announce(self, text: str) -> bool:
         """Шлёт объявление тривоги/відбою в канал. Завжди без звуку.
@@ -1204,13 +1211,17 @@ class Radar:
         """
         await asyncio.sleep(60)
         while True:
-            s = self.stats
-            log.info("жив: переглянуто %d, надіслано %d, дублів %d, помилок %d%s",
-                     s["seen"], s["sent"], s["dupes"], s["errors"],
-                     " (ПАУЗА)" if self.paused else "")
-            if s["seen"] == 0:
-                log.warning("за час роботи не надійшло жодного повідомлення — "
-                            "перевірте список каналів і мережу")
+            try:
+                s = self.stats
+                log.info("жив: переглянуто %d, надіслано %d, дублів %d, "
+                        "помилок %d%s", s["seen"], s["sent"], s["dupes"],
+                        s["errors"], " (ПАУЗА)" if self.paused else "")
+                if s["seen"] == 0:
+                    log.warning("за час роботи не надійшло жодного "
+                               "повідомлення — перевірте список каналів "
+                               "і мережу")
+            except Exception:                                # noqa: BLE001
+                log.exception("_heartbeat впав на цій ітерації — продовжую")
             await asyncio.sleep(15 * 60)
 
     async def _raise_critical(self, res: dict, series: bool, src=None) -> None:
@@ -1264,23 +1275,27 @@ class Radar:
         """Повторяет пачки, пока угроза жива, но не больше лимита."""
         while True:
             await asyncio.sleep(10)
-            if not self.critical:
-                continue
-            now_ts = datetime.now()
+            try:
+                if not self.critical:
+                    continue
+                now_ts = datetime.now()
 
-            # Эпизод закончился: давно нет новых сообщений или исчерпан лимит
-            quiet = now_ts - self.critical["last_event"]
-            if (quiet > timedelta(minutes=config.CRITICAL_EPISODE_MIN)
-                    or self.critical["bursts"] >= config.CRITICAL_MAX_BURSTS
-                    or self.active_threat is None):
-                log.info("епізод особливої небезпеки завершено (%d пачок)",
-                         self.critical["bursts"])
-                self.critical = None
-                continue
+                # Эпизод закончился: давно нет новых сообщений или исчерпан лимит
+                quiet = now_ts - self.critical["last_event"]
+                if (quiet > timedelta(minutes=config.CRITICAL_EPISODE_MIN)
+                        or self.critical["bursts"] >= config.CRITICAL_MAX_BURSTS
+                        or self.active_threat is None):
+                    log.info("епізод особливої небезпеки завершено (%d пачок)",
+                             self.critical["bursts"])
+                    self.critical = None
+                    continue
 
-            # Обстрел продолжается — ещё пачка через минуту
-            if now_ts - self.critical["last_burst"] >= timedelta(minutes=1):
-                await self._send_burst()
+                # Обстрел продолжается — ещё пачка через минуту
+                if now_ts - self.critical["last_burst"] >= timedelta(minutes=1):
+                    await self._send_burst()
+            except Exception:                                # noqa: BLE001
+                log.exception("_critical_loop впав на цій ітерації — "
+                              "продовжую")
 
     async def _watch_threat(self) -> None:
         """Снимает угрозу, если каналы перестали о ней писать.
@@ -1290,19 +1305,23 @@ class Radar:
         """
         while True:
             await asyncio.sleep(60)
-            if not (config.CLEAR_THREAT and self.active_threat):
-                continue
-            quiet = datetime.now() - self.active_threat["last_seen"]
-            if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
-                await self._announce(format_gone(self.active_threat, ""))
-                log.info("загроза знята за мовчанням каналів (%d хв)",
-                         config.CLEAR_AFTER_MIN)
-                self.active_threat = None
-                save_active_threat(None)
-                self.last_alert = None        # закріплене повертається у спокій
-                self.critical = None
-                if self._status_dirty:
-                    self._status_dirty.set()
+            try:
+                if not (config.CLEAR_THREAT and self.active_threat):
+                    continue
+                quiet = datetime.now() - self.active_threat["last_seen"]
+                if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
+                    await self._announce(format_gone(self.active_threat, ""))
+                    log.info("загроза знята за мовчанням каналів (%d хв)",
+                             config.CLEAR_AFTER_MIN)
+                    self.active_threat = None
+                    save_active_threat(None)
+                    self.last_alert = None    # закріплене повертається у спокій
+                    self.critical = None
+                    if self._status_dirty:
+                        self._status_dirty.set()
+            except Exception:                                # noqa: BLE001
+                log.exception("_watch_threat впав на цій ітерації — "
+                              "продовжую")
 
     async def _poll_buttons(self) -> None:
         """Принимает нажатия кнопок: «Оновити» в канале и панель владельца."""
@@ -1607,33 +1626,44 @@ class Radar:
         """
         reason = "старт"
         while True:
-            # Просроченная тревога снимается сама
-            if self.alarm and (datetime.now() - self.alarm[1]
-                               > timedelta(hours=ALARM_MAX_HOURS)):
-                log.warning("тривога висить понад %d год без відбою — знімаю",
-                            ALARM_MAX_HOURS)
-                self.alarm = None
-                save_state(None, self.announced)
+            try:
+                # Просроченная тревога снимается сама
+                if self.alarm and (datetime.now() - self.alarm[1]
+                                   > timedelta(hours=ALARM_MAX_HOURS)):
+                    log.warning("тривога висить понад %d год без відбою — "
+                               "знімаю", ALARM_MAX_HOURS)
+                    self.alarm = None
+                    save_state(None, self.announced)
 
-            if reason == "за розкладом":
-                self.review = None      # мікрозвіт живе до автооновлення
+                if reason == "за розкладом":
+                    self.review = None      # мікрозвіт живе до автооновлення
 
-            text = status.build_text(
-                self.stats, self.started, self.last_alert, self.paused,
-                self.counts, self.alarm, self._wake_reason or reason,
-                self.daily, self.critical["short"] if self.critical else None,
-                self.oblast, self.review)
-            self._wake_reason = None
-            if self.standby:                  # закріплене веде онлайн-екземпляр
+                text = status.build_text(
+                    self.stats, self.started, self.last_alert, self.paused,
+                    self.counts, self.alarm, self._wake_reason or reason,
+                    self.daily,
+                    self.critical["short"] if self.critical else None,
+                    self.oblast, self.review)
+                self._wake_reason = None
+                if self.standby:              # закріплене веде онлайн-екземпляр
+                    await asyncio.sleep(30)
+                    continue
+                ok, info = await asyncio.to_thread(status.publish, text)
+                self._our_edit = datetime.now()
+                self.last_status_ok = ok
+                if ok:
+                    log.info("статус: %s (%s)", info, reason)
+                else:
+                    log.error("статус НЕ оновлено: %s (%s)", info, reason)
+            except Exception:                                # noqa: BLE001
+                # КРИТИЧНО: цей цикл тримає закріплене повідомлення живим.
+                # Без цього захисту одна помилка форматування чи мережі
+                # назавжди зупинила б оновлення закріпленого — і про це
+                # ніхто б не дізнався, доки хтось не помітив би застиглий
+                # час у каналі.
+                log.exception("_status_loop впав на цій ітерації — "
+                              "продовжую")
                 await asyncio.sleep(30)
-                continue
-            ok, info = await asyncio.to_thread(status.publish, text)
-            self._our_edit = datetime.now()
-            self.last_status_ok = ok
-            if ok:
-                log.info("статус: %s (%s)", info, reason)
-            else:
-                log.error("статус НЕ оновлено: %s (%s)", info, reason)
 
             try:
                 await asyncio.wait_for(self._status_dirty.wait(),

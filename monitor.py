@@ -451,10 +451,11 @@ class Radar:
         now_state = "on" if self.alarm else "off"
         if config.ANNOUNCE_ALARM and self.announced != now_state:
             kind = self.alarm[0] if self.alarm else ""
-            await self._announce(format_alarm(kind, local, bool(self.alarm),
-                                              restored=True, src=src))
+            sent = await self._announce(format_alarm(kind, local, bool(self.alarm),
+                                                      restored=True, src=src))
             self.announced = now_state
-            log.info("дослано в чат актуальний стан: %s", now_state)
+            log.info("%s стан у чат: %s", "дослано" if sent else "резерв — не надсилаю",
+                     now_state)
 
         save_state(self.alarm, self.announced)
 
@@ -703,10 +704,15 @@ class Radar:
             await asyncio.sleep(60)
             await self._standby_tick()
 
-    async def _announce(self, text: str) -> None:
-        """Шлёт объявление тревоги/отбоя в канал. Всегда без звука."""
+    async def _announce(self, text: str) -> bool:
+        """Шлёт объявление тривоги/відбою в канал. Завжди без звуку.
+
+        Повертає, чи справді пішло повідомлення — щоб виклики, які потім
+        пишуть у лог «дослано», не брехали, коли резерв мовчки нічого
+        не надіслав (self.standby/self.paused).
+        """
         if self.standby or self.paused:
-            return
+            return False
         ok, info = await asyncio.to_thread(notify.send, text, True)
         if ok:
             self.stats["sent"] += 1
@@ -714,6 +720,7 @@ class Radar:
         else:
             self.stats["errors"] += 1
             log.error("оголошення НЕ надіслано: %s", info)
+        return ok
 
     def _bump(self, field: str) -> None:
         """Увеличивает суточный счётчик, переводя дату при смене суток."""

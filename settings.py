@@ -33,6 +33,8 @@ DEFAULTS = {
         "radar_kharkov",
         "cxidua",
         "kharkivlife",
+        "Nablydatel_Dozor",
+        "monitor1654",
     ],
 
     # --- Города --------------------------------------------------------------

@@ -160,6 +160,37 @@ FRIENDLY = [
     ("не пугайт", "Попередження про звуки"),
 ]
 
+# Канали інколи попереджають про масові хибні спрацьовування системи ППО
+# по якомусь типу цілі («Сьогодні багато "ложних" Бандеролей... фіксується
+# в системі ППО, а по факту їх немає») — це не про конкретну ціль, а
+# загальне попередження, тому окремо від threat_gone.
+_FALSE_ALARM_WORDS = ("хибн", "ложн")
+_FALSE_ALARM_TARGETS = ("бандерол", "шахед", "ракет", "каб", "дрон", "бпла")
+
+
+def false_alarm_notice(text: str) -> str | None:
+    """Повідомлення про масові хибні спрацьовування ППО по цілі.
+
+    Повертає короткий опис для попередження в канал, або None.
+    """
+    body = clean(text)
+    if not body:
+        return None
+    low = (body.lower().replace('"', "").replace("«", "").replace("»", "")
+          .replace("'", ""))
+    has_false_word = any(w in low for w in _FALSE_ALARM_WORDS)
+    has_target = any(w in low for w in _FALSE_ALARM_TARGETS)
+    if has_false_word and has_target:
+        return "мережа моніторингу повідомляє про хибні спрацьовування ППО"
+    has_system_fp = (("фіксу" in low or "фиксир" in low)
+                     and "систем" in low and ("ппо" in low or "пво" in low))
+    has_by_fact_none = (("по факту" in low or "насправді" in low)
+                        and ("нема" in low or "нет" in low
+                             or "не було" in low))
+    if has_system_fp and has_by_fact_none:
+        return "мережа моніторингу повідомляє про хибні спрацьовування ППО"
+    return None
+
 # Территория противника и чужие регионы: «Работа ПВО в Белгороде» —
 # это не наши звуки, и до Зміїва такое не чути.
 NOT_OURS = ["бєлгород", "белгород", "бнр", "брянськ", "брянск", "курськ",

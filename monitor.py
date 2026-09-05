@@ -390,6 +390,7 @@ class Radar:
         self.standby = False            # резерв мовчить, поки живий онлайн
         self.mute_until = None          # тиша на годину: звук тимчасово вимкнено
         self.last_alarm_off = None      # коли надіслали відбій (проти дублів)
+        self.last_false_alarm = None    # коли востаннє попередили про хибні цілі
         self.oblast = None              # (опис, посилання, час) — для закріпленого
         self.gone_votes = {}            # канали, що повідомили про зникнення цілі
         self.rockets = None             # (скільки, тип, час) — ракети в області
@@ -593,8 +594,16 @@ class Radar:
         if not self.client:
             return data
 
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            minutes=config.REVIEW_MINUTES)
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(minutes=config.REVIEW_MINUTES)
+        # Загрозу вважаємо ще актуальною, лише якщо про неї писали не
+        # давніше CLEAR_AFTER_MIN тому — той самий поріг, що й для
+        # зняття активної цілі. REVIEW_MINUTES (40 хв) — це лише як
+        # глибоко читати історію, а не «наскільки старе ще вважати
+        # живим»: без цієї різниці огляд показував ракету, про яку
+        # востаннє писали 30+ хвилин тому, як актуальну просто тому,
+        # що вона трапилась у вікні огляду.
+        fresh_cutoff = now_utc - timedelta(minutes=config.CLEAR_AFTER_MIN)
 
         # Одну й ту саму ціль різні канали (і той самий канал ланцюжком
         # повідомлень) описують кілька разів. Рахуємо унікальні загрози
@@ -620,6 +629,9 @@ class Radar:
         # відповідає) сам згадує головне місто — див. пояснення нижче
         # біля city_gone.
         city_gone_evidence = None
+        # Ракети в області: (час, кількість, тип, канал, id) з усіх
+        # каналів — групуємо по часу нижче, після циклу.
+        oblast_hits = []
 
         for channel in config.CHANNELS:
             ok_channel = False
@@ -672,13 +684,17 @@ class Radar:
                         else:
                             is_new = False
 
-                        if is_new and is_new_key:
+                        if is_new and is_new_key and msg.date >= fresh_cutoff:
                             # Загрозою місту рахуємо лише те, де назване
                             # саме воно. Решта, що справді поруч — «поруч».
                             # Якщо цей самий канал уже написав «не
                             # фіксується» — ціль не рахуємо як актуальну:
                             # інакше огляд суперечив би заголовку
                             # закріпленого, яке це зняття вже врахувало.
+                            # msg.date >= fresh_cutoff — не рахуємо те, про
+                            # що вже CLEAR_AFTER_MIN хвилин ніхто не пише:
+                            # інакше стара ракета з початку 40-хвилинного
+                            # вікна виглядала б у звіті як актуальна.
                             if res.get("main_city"):
                                 if channel not in gone_channels:
                                     data["threats"] += 1
@@ -700,13 +716,9 @@ class Radar:
 
                     hit = classify.oblast_rockets(msg.text)
                     if hit:
-                        count, _kind = hit
-                        # Джерело беремо від найдетальнішого повідомлення:
-                        # де названо найбільшу кількість цілей.
-                        if count >= data["oblast"]:
-                            data["oblast"] = count
-                            data["oblast_link"] = f"https://t.me/{channel}/{msg.id}"
-                            data["oblast_when"] = msg.date
+                        count, kind = hit
+                        oblast_hits.append((msg.date, count, kind, channel,
+                                           msg.id))
             except Exception:                               # noqa: BLE001
                 continue
             if ok_channel:
@@ -721,6 +733,37 @@ class Radar:
             data["city_gone_wording"] = wording
             data["city_gone_text"] = text
             data["city_gone_link"] = (channel, f"https://t.me/{channel}/{msg_id}")
+
+        # Ракети в області: рахуємо лише свіжі (не старші за
+        # CLEAR_AFTER_MIN — якщо про них уже 10+ хвилин ніхто не пише,
+        # показувати їх у міні-звіті як актуальні — вводити в оману).
+        # Різні канали часто пишуть про ОДНУ й ту саму ракету протягом
+        # однієї-двох хвилин — це не 2 окремі цілі, а один допис,
+        # підтверджений кількома каналами, тому такі згадки групуємо і
+        # рахуємо як одну подію (беремо найбільшу названу кількість).
+        # А ось повідомлення з різницею в 5-10+ хвилин — це вже, швидше
+        # за все, різні, окремі ракети, і їх додаємо одна до одної.
+        fresh_hits = sorted(
+            (h for h in oblast_hits
+             if now_utc - h[0] <= timedelta(minutes=config.CLEAR_AFTER_MIN)),
+            key=lambda h: h[0])
+        clusters = []
+        for hit in fresh_hits:
+            if clusters and hit[0] - clusters[-1][-1][0] <= timedelta(minutes=2):
+                clusters[-1].append(hit)
+            else:
+                clusters.append([hit])
+        total = 0
+        best_when, best_link = None, None
+        for cluster in clusters:
+            best = max(cluster, key=lambda h: h[1])
+            total += best[1]
+            if best_when is None or best[0] > best_when:
+                best_when = best[0]
+                best_link = f"https://t.me/{best[3]}/{best[4]}"
+        data["oblast"] = total
+        data["oblast_link"] = best_link
+        data["oblast_when"] = best_when
 
         log.info("огляд: канали %d, повідомлень %d, загроз %d",
                  data["channels"], data["messages"], data["threats"])
@@ -978,6 +1021,32 @@ class Radar:
                         log.error("CIVIL НЕ відправлено: %s", info)
                     self.dedup.save()
                 return
+
+        # Канал попереджає про масові хибні спрацьовування ППО по цілі
+        # (наприклад «Бандероль»). Це не про конкретну ціль, а загальне
+        # попередження — надсилаємо не частіше ніж раз на годину, щоб
+        # кілька таких дописів поспіль не спамили канал.
+        notice = classify.false_alarm_notice(text)
+        if notice:
+            now_ts = datetime.now()
+            if (self.last_false_alarm is None
+                    or now_ts - self.last_false_alarm > timedelta(hours=1)):
+                msg = ("⚠️ <b>МОЖЛИВІ ХИБНІ СПРАЦЬОВУВАННЯ</b>\n"
+                      f"⚠️ {notice.capitalize()}\n"
+                      f"\n{escape(text)[:400]}\n"
+                      f"\n<i>Це попередження від {escape(username)}, "
+                      "не висновок радара.</i>" + source_line(src))
+                ok, info = await asyncio.to_thread(notify.send, msg, True)
+                if ok:
+                    self.stats["sent"] += 1
+                    self.last_false_alarm = now_ts
+                    log.info("попередження про хибні цілі надіслано (%s)",
+                             username)
+                else:
+                    self.stats["errors"] += 1
+                    log.error("попередження про хибні цілі НЕ надіслано: %s",
+                              info)
+            return
 
         # Ціль пішла в інший бік — це не відбій, казати «все добре» рано
         if self.active_threat and context:

@@ -141,7 +141,16 @@ DEFAULTS = {
     # --- Служебное -----------------------------------------------------------
     "dedup_window_min": 12,     # окно склейки дублей из разных каналов, минуты
     "dump_days": 30,            # глубина выгрузки истории, дни
+
+    # Мітка часу останньої синхронізації з хмарою (кнопка «Синхронізувати
+    # налаштування» в застосунку). Не редагується вручну.
+    "_synced_at": "",
 }
+
+# Ключі, які кнопка «Синхронізувати налаштування» НЕ передає в хмару:
+# роль хмара визначає сама через RADAR_ROLE, а власника бота й дані
+# каналу небезпечно й безглуздо перетирати чужими/застарілими значеннями.
+SYNC_EXCLUDE = {"role", "owner_id", "target_chat_id", "bot_token", "_synced_at"}
 
 # Короткие описания для подсказок в интерфейсе (кнопки «?»).
 HELP = {
@@ -356,6 +365,24 @@ def load() -> dict:
     env_role = os.environ.get("RADAR_ROLE")
     if env_role in ("main", "backup"):
         values["role"] = env_role
+
+    # Налаштування, надіслані кнопкою «Синхронізувати налаштування» з
+    # застосунку. Застосовуються один раз: мітка _synced_at, збережена
+    # тут-таки на диск, не дає повторно накочувати ті самі (вже застарілі)
+    # значення при кожному наступному перезапуску контейнера.
+    pushed = os.environ.get("RADAR_SETTINGS_JSON")
+    if pushed:
+        try:
+            incoming = json.loads(pushed)
+        except (json.JSONDecodeError, ValueError):
+            incoming = None
+        if isinstance(incoming, dict) and incoming.get("_synced_at") and \
+                incoming["_synced_at"] != values.get("_synced_at"):
+            for key, val in incoming.items():
+                if key in DEFAULTS and key not in SYNC_EXCLUDE:
+                    values[key] = val
+            values["_synced_at"] = incoming["_synced_at"]
+            save(values)
 
     return values
 

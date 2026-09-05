@@ -70,6 +70,30 @@ def set_role(role: str) -> tuple:
     return restart()
 
 
+def push_settings(data: dict) -> tuple:
+    """Надсилає локальні налаштування в хмару й перезапускає її.
+
+    Односторонньо: з комп'ютера в хмару. data повинна вже містити
+    актуальну мітку "_synced_at" — за нею settings.load() на хмарі
+    зрозуміє, що це нові дані, і застосує їх один раз.
+    """
+    if not available():
+        return False, "хмарне керування не налаштоване"
+
+    ok, err = _call(
+        "mutation($input: VariableUpsertInput!) { variableUpsert(input: $input) }",
+        {"input": {"projectId": config.RAILWAY_PROJECT_ID,
+                   "environmentId": config.RAILWAY_ENVIRONMENT_ID,
+                   "serviceId": config.RAILWAY_SERVICE_ID,
+                   "name": "RADAR_SETTINGS_JSON",
+                   "value": json.dumps(data, ensure_ascii=False),
+                   "skipDeploys": True}})
+    if not ok:
+        return False, f"не вдалося надіслати налаштування: {err}"
+
+    return restart()
+
+
 def restart() -> tuple:
     """Перезапускає хмарний сервіс із поточними налаштуваннями.
 

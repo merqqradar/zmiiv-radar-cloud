@@ -569,6 +569,7 @@ class Radar:
         data = {"when": datetime.now(), "channels": 0, "messages": 0,
                 "threats": 0, "oblast": 0, "near": 0, "by_type": {},
                 "top": None, "top_when": None, "top_link": None,
+                "top_gone": False,
                 "oblast_link": None, "oblast_when": None,
                 "city_last_seen": None}
         if not self.client:
@@ -589,6 +590,14 @@ class Radar:
         # від кожного каналу за огляд: інакше рух однієї цілі роздувався
         # у кілька штук («поруч: 6» замість «поруч: 1»).
         threat_channels, near_channels = set(), set()
+        # Канал часто сам знімає свою ціль повідомленням «не фіксується» /
+        # «не спостерігається». Без цього смарт-огляд рахував саму згадку
+        # загрози, навіть якщо той самий канал уже написав, що вона зникла —
+        # і заголовок закріпленого («немає загроз») суперечив рядку огляду.
+        # Повідомлення йдуть від найновішого до найстаршого, тому на
+        # момент, коли доходимо до самого допису про загрозу, «зняття»
+        # цього ж каналу вже потрапило в gone_channels.
+        gone_channels = set()
 
         for channel in config.CHANNELS:
             ok_channel = False
@@ -599,6 +608,9 @@ class Radar:
                     if msg.date < cutoff or not msg.text:
                         continue
                     data["messages"] += 1
+
+                    if classify.threat_gone(msg.text, ""):
+                        gone_channels.add(channel)
 
                     res = classify.classify(msg.text)
                     if res and res["level"] in ("HIGH", "MEDIUM"):
@@ -626,8 +638,13 @@ class Radar:
                         if is_new and is_new_key:
                             # Загрозою місту рахуємо лише те, де назване
                             # саме воно. Решта, що справді поруч — «поруч».
+                            # Якщо цей самий канал уже написав «не
+                            # фіксується» — ціль не рахуємо як актуальну:
+                            # інакше огляд суперечив би заголовку
+                            # закріпленого, яке це зняття вже врахувало.
                             if res.get("main_city"):
-                                data["threats"] += 1
+                                if channel not in gone_channels:
+                                    data["threats"] += 1
                             elif res.get("near_home"):
                                 data["near"] += 1
                             for name, _e in res["threats"]:
@@ -642,6 +659,7 @@ class Radar:
                             data["top"] = plain_headline(res)
                             data["top_when"] = msg.date
                             data["top_link"] = f"https://t.me/{channel}/{msg.id}"
+                            data["top_gone"] = channel in gone_channels
 
                     hit = classify.oblast_rockets(msg.text)
                     if hit:
@@ -926,8 +944,19 @@ class Radar:
 
         # Канал повідомив, що ціль зникла або збита.
         # Один канал — ще не відбій: чекаємо підтвердження другого.
+        if config.CLEAR_THREAT and not self.active_threat:
+            # Діагностика: якщо схоже на «зняття», але activate_threat уже
+            # порожній — саме так виглядав би пропуск оголошення «загроза
+            # минула» (ціль зняли раніше, ніж прийшла ця відповідь).
+            if classify.threat_gone(text, context):
+                log.info("gone-сигнал від %s, але active_threat вже порожній "
+                         "— пропускаю", username)
         if config.CLEAR_THREAT and self.active_threat:
             gone = classify.threat_gone(text, context)
+            if gone:
+                other_region = geo.mentions_other_region(text.lower())
+                log.info("gone-сигнал від %s: %s (враховано: %s)",
+                         username, gone[0], not other_region)
             if gone and not geo.mentions_other_region(text.lower()):
                 self.gone_votes[username] = datetime.now()
                 votes = len([t for t in self.gone_votes.values()
@@ -1102,6 +1131,30 @@ class Radar:
                 for name, _emoji in res["threats"]:
                     self._bump_type("impact_types", name)
 
+            # Стан (активна ціль, заголовок закріпленого) виставляємо
+            # ДО «особливої небезпеки» нижче: _raise_critical шле пачку
+            # повторів з паузами між ними, а тим часом _critical_loop
+            # (тік раз на 10 с) перевіряє active_threat і, побачивши
+            # його порожнім, одразу закриває епізод після першої ж
+            # пачки. Раніше active_threat виставлявся вже ПІСЛЯ виклику
+            # _raise_critical — і саме тому серія іноді уривалась на
+            # «1 пачці» замість того, щоб тривати, поки триває обстріл.
+            if res["level"] == "HIGH" or (res["level"] == "MEDIUM"
+                                          and res.get("main_city")):
+                now_ts = datetime.now()
+                main = geo.main_name()
+                place = main if main in res["places"] else (
+                    res["places"][0] if res["places"] else main)
+                if self.active_threat and self.active_threat["place"] == place:
+                    self.active_threat["last_seen"] = now_ts
+                else:
+                    self.active_threat = {"place": place, "since": now_ts,
+                                          "last_seen": now_ts}
+                save_active_threat(self.active_threat)
+            if res.get("main_city"):
+                self.last_alert = (datetime.now(), res["level"],
+                                   plain_headline(res))
+
             # Особлива небезпека: масова або важка загроза, або серія
             # гучних сповіщень підряд. Одна ціль повторів не дає.
             if config.CRITICAL_ENABLED and res["level"] == "HIGH":
@@ -1126,21 +1179,6 @@ class Radar:
                 if res.get("mass_reason") or series:
                     await self._raise_critical(res, series, src)
 
-            if res["level"] == "HIGH" or (res["level"] == "MEDIUM"
-                                          and res.get("main_city")):
-                now_ts = datetime.now()
-                main = geo.main_name()
-                place = main if main in res["places"] else (
-                    res["places"][0] if res["places"] else main)
-                if self.active_threat and self.active_threat["place"] == place:
-                    self.active_threat["last_seen"] = now_ts
-                else:
-                    self.active_threat = {"place": place, "since": now_ts,
-                                          "last_seen": now_ts}
-                save_active_threat(self.active_threat)
-            if res.get("main_city"):
-                self.last_alert = (datetime.now(), res["level"],
-                                   plain_headline(res))
             log.info("%s отправлено [%s] %s", res["level"], res["reason"],
                      res["text"][:60])
             if self.on_alert:
@@ -1641,8 +1679,19 @@ class Radar:
                 last_id[channel] = max(m.id for m in msgs)
                 for m in sorted(new, key=lambda x: x.id):
                     reply_text = m.reply_text if config.FILTER_CONTEXT else None
-                    await self._ingest(channel, m.id, m.date, m.text,
-                                       reply_text)
+                    try:
+                        await self._ingest(channel, m.id, m.date, m.text,
+                                           reply_text)
+                    except Exception:                        # noqa: BLE001
+                        # КРИТИЧНО: без цього одне «погане» повідомлення
+                        # назавжди вбиває весь цикл опитування — решта
+                        # тасків (кнопки, статус) далі працюють, і це
+                        # виглядає так, ніби радар живий, але мовчить.
+                        # Саме так одного разу «Оновити» ще працювало,
+                        # а нові повідомлення взагалі не оброблялись.
+                        log.exception("_ingest впав на %s/%s — пропускаю "
+                                      "це повідомлення, продовжую опитування",
+                                      channel, m.id)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Основной цикл. Завершается, когда выставлен stop_event."""

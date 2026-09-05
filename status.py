@@ -77,11 +77,15 @@ def format_review(data: dict, city: str, html: bool = True) -> str:
     ]
     if data.get("top"):
         when = data["top_when"].astimezone().strftime("%H:%M")
+        # Канал сам написав «не фіксується» — не показуємо це як живу
+        # загрозу, інакше рядок суперечить заголовку, який зняття вже
+        # врахував.
+        note = " · <i>вже не актуально</i>" if data.get("top_gone") else ""
         if html and data.get("top_link"):
             lines.append(f"Найсвіжіша: {data['top']} о {when} · "
-                         f"<a href=\"{data['top_link']}\">джерело</a>")
+                         f"<a href=\"{data['top_link']}\">джерело</a>{note}")
         else:
-            lines.append(f"Найсвіжіша: {data['top']} о {when}")
+            lines.append(f"Найсвіжіша: {data['top']} о {when}{note}")
     return "\n".join(lines)
 
 

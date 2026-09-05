@@ -29,6 +29,7 @@ import threats
 import settings
 import notify
 import public_source
+import railway_ctl
 import status
 
 # --- Логирование ------------------------------------------------------------
@@ -161,6 +162,10 @@ PANEL_HELP = """🎛 <b>Керування радаром</b>
 
 📊 <b>Звіт</b> — надсилає в канал підсумок за добу: загрози, прильоти, тривоги, відключення світла.
 
+🏠 <b>Локально</b> / 🌐 <b>Онлайн</b> — де зараз працює радар: на цьому пристрої чи на сервері. Активний варіант позначений ✅. Перемикання одразу застосовується з обох боків, якщо хмара налаштована.
+
+🔁 <b>Перезапустити онлайн</b> — на випадок збою хмарного екземпляра.
+
 ℹ️ <b>Стан радара</b> — відповідає сюди: чи працює, скільки каналів слухає, скільки повідомлень переглянув, чи триває тривога.
 
 🔄 <b>Оновити статус</b> — оновлює закріплене повідомлення в каналі просто зараз.
@@ -170,6 +175,7 @@ PANEL_HELP = """🎛 <b>Керування радаром</b>
 ✅ <b>Перевірка зв'язку</b> — надсилає в канал тестове повідомлення.
 
 <i>Команди: /panel /pause /resume /mute /report /status /state
+/local /online /restart_cloud
 Кнопки працюють, поки радар запущений.</i>"""
 
 LEVEL_STYLE = {
@@ -392,6 +398,7 @@ class Radar:
         self.last_types_by_channel = {}  # канал -> (час, типи): для ланцюжків
         self.client = None               # для огляду за кнопкою
         self.review = None               # (підсумок, час) — результат огляду
+        self.mode_message = ""           # текст після перемикання локально/онлайн
         self._our_edit = None           # коли ми самі правили закріплене
         self.last_status_ok = None      # удалось ли последнее обновление статуса
         self.paused = False
@@ -494,6 +501,18 @@ class Radar:
             return
         when, place = found
         local = when.astimezone().replace(tzinfo=None)
+
+        # Якщо ціль уже застаріла станом на момент відновлення (застосунок
+        # був вимкнений довше, ніж CLEAR_AFTER_MIN) — не відновлюємо її
+        # як активну. Інакше перший же тік _watch_threat одразу шле
+        # «загроза минула» про подію, що давно нікому не цікава, і в чаті
+        # з'являється сплутане повідомлення з давнім часом посеред ночі.
+        # Такий сценарій справді вже траплявся при перезапуску.
+        if datetime.now() - local > timedelta(minutes=config.CLEAR_AFTER_MIN):
+            log.info("ціль з %s вже застаріла на момент запуску — не відновлюю",
+                     local.strftime("%H:%M"))
+            return
+
         self.active_threat = {"place": place, "since": local, "last_seen": local}
         save_active_threat(self.active_threat)
         log.info("відновлено активну ціль: %s, останнє згадування о %s",
@@ -1327,11 +1346,22 @@ class Radar:
             await asyncio.to_thread(
                 notify.send_to, chat_id, PANEL_HELP,
                 notify.control_panel(self.paused, self.is_muted(),
-                                     config.FILTER_PLANNED))
+                                     config.FILTER_PLANNED,
+                                     config.ROLE == "backup"))
         elif text.startswith("/mute"):
             self.mute_until = datetime.now() + timedelta(hours=1)
             await asyncio.to_thread(notify.send_to, chat_id,
                                     f"🔕 Тиша до {self.mute_until:%H:%M}")
+        elif text.startswith("/local"):
+            await asyncio.to_thread(notify.send_to, chat_id,
+                                    "🏠 " + await self.set_mode(online=False))
+        elif text.startswith("/online"):
+            await asyncio.to_thread(notify.send_to, chat_id,
+                                    "🌐 " + await self.set_mode(online=True))
+        elif text.startswith("/restart_cloud"):
+            ok, info = await asyncio.to_thread(railway_ctl.restart)
+            await asyncio.to_thread(notify.send_to, chat_id,
+                                    "🔁 Онлайн перезапускається" if ok else f"⚠️ {info}")
         elif text.startswith("/pause"):
             self.paused = True
             await asyncio.to_thread(notify.send_to, chat_id, "⏸ Пауза увімкнена")
@@ -1351,7 +1381,35 @@ class Radar:
         else:
             await asyncio.to_thread(
                 notify.send_to, chat_id,
-                "Команди: /panel /pause /resume /mute /report /status /state")
+                "Команди: /panel /pause /resume /mute /report /status /state /local /online /restart_cloud")
+
+    async def set_mode(self, online: bool) -> str:
+        """Перемикає локально/онлайн: власну роль і, якщо налаштовано, хмару.
+
+        online=True  — цей екземпляр іде в резерв, хмара стає активною.
+        online=False — цей екземпляр стає активним, хмара іде в резерв.
+
+        Використовується і кнопкою в застосунку, і кнопкою в боті —
+        єдина логіка, щоб не розходилась поведінка.
+        """
+        my_role = "backup" if online else "main"
+        cloud_role = "main" if online else "backup"
+
+        saved = settings.load()
+        saved["role"] = my_role
+        settings.save(saved)
+        config.reload_settings()
+        await self._standby_tick()          # застосувати одразу, не чекаючи хвилину
+
+        lines = [f"Цей екземпляр: {'резерв' if online else 'основний'}."]
+        if railway_ctl.available():
+            ok, info = await asyncio.to_thread(railway_ctl.set_role, cloud_role)
+            lines.append(f"Хмара: {'активна' if ok and online else 'резерв' if ok else info}")
+        elif online:
+            lines.append("Хмарне керування не налаштоване — увімкніть хмару "
+                         "вручну, якщо вона ще не активна.")
+
+        return "\n".join(lines)
 
     async def _control(self, query: dict, action: str) -> None:
         """Нажатие кнопки на панели управления."""
@@ -1369,7 +1427,8 @@ class Radar:
                 notify.send_to, chat_id,
                 f"{reply}\n<i>{datetime.now():%H:%M}</i>",
                 notify.control_panel(self.paused, self.is_muted(),
-                                     config.FILTER_PLANNED))
+                                     config.FILTER_PLANNED,
+                                     config.ROLE == "backup"))
         elif action == "mute":
             if self.is_muted():
                 self.mute_until = None
@@ -1380,7 +1439,8 @@ class Radar:
             await asyncio.to_thread(
                 notify.send_to, chat_id, reply,
                 notify.control_panel(self.paused, self.is_muted(),
-                                     config.FILTER_PLANNED))
+                                     config.FILTER_PLANNED,
+                                     config.ROLE == "backup"))
 
         elif action == "review":
             data = await self._smart_review()
@@ -1418,7 +1478,8 @@ class Radar:
                      else "⚠️ Розумні фільтри вимкнено")
             await asyncio.to_thread(
                 notify.send_to, chat_id, reply,
-                notify.control_panel(self.paused, self.is_muted(), new_value))
+                notify.control_panel(self.paused, self.is_muted(), new_value,
+                                     config.ROLE == "backup"))
 
         elif action == "test":
             ok, info = await asyncio.to_thread(
@@ -1438,6 +1499,14 @@ class Radar:
         elif action == "state":
             await asyncio.to_thread(notify.send_to, chat_id, self._state_text())
             reply = "ℹ️ Надіслано"
+
+        elif action == "mode_local":
+            reply = "🏠 " + await self.set_mode(online=False)
+        elif action == "mode_online":
+            reply = "🌐 " + await self.set_mode(online=True)
+        elif action == "restart_cloud":
+            ok, info = await asyncio.to_thread(railway_ctl.restart)
+            reply = "🔁 Онлайн перезапускається" if ok else f"⚠️ {info}"
         else:
             reply = "Невідома дія"
 

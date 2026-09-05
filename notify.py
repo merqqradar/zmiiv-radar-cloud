@@ -109,13 +109,22 @@ REFRESH_BUTTON = {"inline_keyboard": [[{"text": "🔄 Оновити",
 
 # Панель управления в личной переписке с ботом. Доступна только владельцу.
 def control_panel(paused: bool, muted: bool = False,
-                  smart: bool = True) -> dict:
-    """Панель управления в личной переписке. Доступна только владельцу."""
+                  smart: bool = True, online: bool = False) -> dict:
+    """Панель управления в личной переписке. Доступна только владельцу.
+
+    online — де зараз активна робота: True — на хмарі (Онлайн),
+    False — на цьому пристрої (Локально). Активний варіант позначений ✅.
+    """
     return {"inline_keyboard": [
         [{"text": "▶️ Відновити" if paused else "⏸ Пауза",
           "callback_data": "ctl:pause"},
          {"text": "🔔 Увімкнути звук" if muted else "🔕 Тиша на годину",
           "callback_data": "ctl:mute"}],
+        [{"text": ("✅ " if not online else "") + "🏠 Локально",
+          "callback_data": "ctl:mode_local"},
+         {"text": ("✅ " if online else "") + "🌐 Онлайн",
+          "callback_data": "ctl:mode_online"}],
+        [{"text": "🔁 Перезапустити онлайн", "callback_data": "ctl:restart_cloud"}],
         [{"text": "📊 Звіт сьогодні", "callback_data": "ctl:report"},
          {"text": "📅 Звіт за вчора", "callback_data": "ctl:report_prev"}],
         [{"text": "ℹ️ Стан радара", "callback_data": "ctl:state"}],

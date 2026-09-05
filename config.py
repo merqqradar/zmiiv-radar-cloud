@@ -41,6 +41,16 @@ TG_PHONE = os.getenv("TG_PHONE", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "").strip()
 
+# Для керування хмарним екземпляром із застосунку/бота (перемикач
+# локально/онлайн, перезапуск). НЕ обов'язкові: без них ці кнопки
+# просто повідомлять «не налаштовано». НІКОЛИ не заповнюються на
+# хмарному екземплярі — токен дає керування самим Railway-проєктом,
+# тримати його на публічному сервері не можна.
+RAILWAY_TOKEN = os.getenv("RAILWAY_TOKEN", "").strip()
+RAILWAY_PROJECT_ID = os.getenv("RAILWAY_PROJECT_ID", "").strip()
+RAILWAY_SERVICE_ID = os.getenv("RAILWAY_SERVICE_ID", "").strip()
+RAILWAY_ENVIRONMENT_ID = os.getenv("RAILWAY_ENVIRONMENT_ID", "").strip()
+
 # Значения из настроек приложения перекрывают .env: так можно
 # перенаправить радар в другой канал, не трогая файлы.
 

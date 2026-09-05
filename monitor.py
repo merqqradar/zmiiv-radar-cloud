@@ -544,9 +544,16 @@ class Radar:
                     quiet_enough = (datetime.now() -
                                     self.active_threat["last_seen"]
                                     > timedelta(minutes=3))
-                    if not fresh and quiet_enough:
+                    # Явне «не фіксується» від каналу, що сам згадував цю
+                    # ціль, — досить сама по собі, незалежно від «свіжості»:
+                    # ця ж репліка й РОБИТЬ згадку «свіжою», інакше вона
+                    # назавжди блокувала б власне зняття, яке підтверджує.
+                    city_gone = self.review.get("city_gone")
+                    if city_gone or (not fresh and quiet_enough):
                         await self._announce(format_gone(self.active_threat, ""))
-                        log.info("загроза знята за смарт-перевіркою (кнопка)")
+                        log.info("загроза знята за смарт-перевіркою (кнопка, "
+                                "%s)", "явне «не фіксується»" if city_gone
+                                else "мовчання")
                         self.active_threat = None
                         save_active_threat(None)
                         self.last_alert = None
@@ -571,7 +578,7 @@ class Radar:
                 "top": None, "top_when": None, "top_link": None,
                 "top_gone": False,
                 "oblast_link": None, "oblast_when": None,
-                "city_last_seen": None}
+                "city_last_seen": None, "city_gone": False}
         if not self.client:
             return data
 
@@ -674,6 +681,12 @@ class Radar:
                 continue
             if ok_channel:
                 data["channels"] += 1
+
+        # Канал, що згадав ціль по місту, а потім сам написав «не
+        # фіксується» / «не спостерігається» про неї — явне підтвердження
+        # зняття. Свіжість цієї ж згадки (city_last_seen) тут не має
+        # значення: сам факт «не фіксується» важливіший за час.
+        data["city_gone"] = bool(gone_channels & threat_channels)
 
         log.info("огляд: канали %d, повідомлень %d, загроз %d",
                  data["channels"], data["messages"], data["threats"])
@@ -1643,7 +1656,7 @@ class Radar:
                     self.counts, self.alarm, self._wake_reason or reason,
                     self.daily,
                     self.critical["short"] if self.critical else None,
-                    self.oblast, self.review)
+                    self.oblast, self.review, self.active_threat)
                 self._wake_reason = None
                 if self.standby:              # закріплене веде онлайн-екземпляр
                     await asyncio.sleep(30)

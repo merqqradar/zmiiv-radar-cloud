@@ -91,7 +91,8 @@ def format_review(data: dict, city: str, html: bool = True) -> str:
 
 def build_text(stats: dict, started: datetime, last_alert, paused: bool,
                counts: dict, alarm=None, reason: str = "", daily=None,
-               critical=None, oblast=None, review=None) -> str:
+               critical=None, oblast=None, review=None,
+               active_threat=None) -> str:
     """Собирает текст закреплённого сообщения.
 
     Первая строка — самая важная: в списке закреплённых Telegram
@@ -113,6 +114,13 @@ def build_text(stats: dict, started: datetime, last_alert, paused: bool,
         # Заголовок уже вида «🚀 РАКЕТА → Зміїв» — берём его как есть
         clean = title.split(" ", 1)[-1] if " " in title else title
         head = f"{icon} <b>{clean.upper()}</b> · о {when:%H:%M}"
+    elif active_threat:
+        # last_alert не переживає перезапуск (не зберігається на диск),
+        # а active_threat — переживає. Без цієї гілки закріплене після
+        # перезапуску показувало б «загроз немає» під час реальної цілі,
+        # яку радар усередині досі вважає активною.
+        head = (f"🔴 <b>ЗАГРОЗА → {active_threat['place'].upper()}</b> · "
+               f"з {active_threat['since']:%H:%M}")
     elif alarm:
         head = f"🟡 <b>{alarm[0].upper()}</b> · з {alarm[1]:%H:%M}"
     else:

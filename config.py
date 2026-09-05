@@ -21,10 +21,19 @@ if IS_APP:
 else:
     BASE_DIR = Path(__file__).resolve().parent
 
-DATA_DIR = BASE_DIR / "data"
+# На Railway диск контейнера стирається при кожному перезапуску — без
+# постійного диска (Volume) стан тривоги й закріпленого забувається,
+# і радар при кожному рестарті дублює повідомлення в канал. RADAR_DATA_DIR
+# вказує на змонтований Volume, коли він є.
+_data_override = os.getenv("RADAR_DATA_DIR", "").strip()
+DATA_DIR = Path(_data_override) if _data_override else BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
+
+# Чи це хмарний (Railway) екземпляр — вливає на те, як трактувати
+# власну роль у панелі керування ботом (див. config.cloud_active()).
+IS_CLOUD = os.getenv("RADAR_IS_CLOUD", "").strip() == "1"
 
 # Єдиний номер версії радара. Показується у вікні застосунку, поруч
 # з назвою «Радар Зміїв». Піднімати на одиницю при кожному помітному
@@ -100,6 +109,18 @@ SMART_EXPLAIN = _S["smart_explain"]
 SMART_BEFORE_SERIES = _S["smart_before_series"]
 ROLE = _S["role"]
 OWNER_ID = _S["owner_id"]
+
+
+def cloud_active() -> bool:
+    """Чи зараз активна саме хмара (для галочки «Локально/Онлайн» у боті).
+
+    ROLE описує роль ЦЬОГО екземпляра, а не те, хто активний глобально.
+    На хмарі ROLE == "main" означає, що активна хмара; на локальному
+    пристрої те саме означає активна саме хмара, коли ROLE == "backup".
+    Без цієї різниці бот, відповідаючи з хмари, показував би галочку
+    так, ніби активний локальний пристрій.
+    """
+    return ROLE == "main" if IS_CLOUD else ROLE == "backup"
 if _S.get("target_chat_id"):
     TARGET_CHAT_ID = _S["target_chat_id"].strip()
 if _S.get("bot_token"):

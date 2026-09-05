@@ -1347,7 +1347,7 @@ class Radar:
                 notify.send_to, chat_id, PANEL_HELP,
                 notify.control_panel(self.paused, self.is_muted(),
                                      config.FILTER_PLANNED,
-                                     config.ROLE == "backup"))
+                                     config.cloud_active()))
         elif text.startswith("/mute"):
             self.mute_until = datetime.now() + timedelta(hours=1)
             await asyncio.to_thread(notify.send_to, chat_id,
@@ -1428,7 +1428,7 @@ class Radar:
                 f"{reply}\n<i>{datetime.now():%H:%M}</i>",
                 notify.control_panel(self.paused, self.is_muted(),
                                      config.FILTER_PLANNED,
-                                     config.ROLE == "backup"))
+                                     config.cloud_active()))
         elif action == "mute":
             if self.is_muted():
                 self.mute_until = None
@@ -1440,7 +1440,7 @@ class Radar:
                 notify.send_to, chat_id, reply,
                 notify.control_panel(self.paused, self.is_muted(),
                                      config.FILTER_PLANNED,
-                                     config.ROLE == "backup"))
+                                     config.cloud_active()))
 
         elif action == "review":
             data = await self._smart_review()
@@ -1479,7 +1479,7 @@ class Radar:
             await asyncio.to_thread(
                 notify.send_to, chat_id, reply,
                 notify.control_panel(self.paused, self.is_muted(), new_value,
-                                     config.ROLE == "backup"))
+                                     config.cloud_active()))
 
         elif action == "test":
             ok, info = await asyncio.to_thread(

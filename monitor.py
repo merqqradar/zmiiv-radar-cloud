@@ -421,6 +421,7 @@ class Radar:
         self.last_alert = None
         self.alarm, self.announced = load_state()   # стан і що вже в чаті
         self.active_threat = load_active_threat()  # конкретна ціль, про яку вже сповістили
+        self.near_threat = None         # ціль «поруч» (сусіднє село) — легший стан, не переживає рестарт
         self.daily = load_daily()       # лічильники за добу
         self.critical = None            # епізод особливої небезпеки
         self.recent_high = []           # часи гучних сповіщень (для серії)
@@ -1445,6 +1446,20 @@ class Radar:
                                           "last_seen": now_ts, "kind": kind,
                                           "last_src": src}
                 save_active_threat(self.active_threat)
+            elif res["level"] == "MEDIUM" and res.get("near_home"):
+                # «Поруч» (сусіднє село, ще не загроза місту) досі не
+                # мав власного закриття: на відміну від active_threat,
+                # він ніколи не знімався по тиші — «загроза минула» про
+                # такі цілі просто ніколи не приходила. Окремий, легший
+                # стан: не займає active_threat (інакше сусіднє село
+                # тихо підмінило б собою реальну ціль по місту).
+                now_ts = datetime.now()
+                near_place = res["places"][0] if res["places"] else "поруч"
+                if self.near_threat and self.near_threat["place"] == near_place:
+                    self.near_threat["last_seen"] = now_ts
+                else:
+                    self.near_threat = {"place": near_place, "since": now_ts,
+                                        "last_seen": now_ts}
             if res.get("main_city"):
                 self.last_alert = (datetime.now(), res["level"],
                                    plain_headline(res))
@@ -1595,28 +1610,45 @@ class Radar:
         while True:
             await asyncio.sleep(60)
             try:
-                if not (config.CLEAR_THREAT and self.active_threat):
-                    continue
-                quiet = datetime.now() - self.active_threat["last_seen"]
-                if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
-                    sent = await self._announce(
-                        format_gone(self.active_threat, ""))
-                    if sent:
-                        log.info("загроза знята за мовчанням каналів (%d хв)",
-                                 config.CLEAR_AFTER_MIN)
-                        self.active_threat = None
-                        save_active_threat(None)
-                        self.last_alert = None  # закріплене повертається у спокій
-                        self.critical = None
-                        if self._status_dirty:
-                            self._status_dirty.set()
-                    else:
-                        # Не знімаємо мовчки, якщо повідомлення не
-                        # пішло — інакше закріплене «заспокоїться», а в
-                        # чат ніхто так і не дізнається, що загроза
-                        # минула. Спробуємо ще раз за хвилину.
-                        log.warning("зняття загрози НЕ надіслано — "
-                                   "ціль залишаю активною до наступної спроби")
+                if config.CLEAR_THREAT and self.active_threat:
+                    quiet = datetime.now() - self.active_threat["last_seen"]
+                    if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
+                        sent = await self._announce(
+                            format_gone(self.active_threat, ""))
+                        if sent:
+                            log.info("загроза знята за мовчанням каналів "
+                                    "(%d хв)", config.CLEAR_AFTER_MIN)
+                            self.active_threat = None
+                            save_active_threat(None)
+                            self.last_alert = None  # закріплене повертається у спокій
+                            self.critical = None
+                            if self._status_dirty:
+                                self._status_dirty.set()
+                        else:
+                            # Не знімаємо мовчки, якщо повідомлення не
+                            # пішло — інакше закріплене «заспокоїться», а в
+                            # чат ніхто так і не дізнається, що загроза
+                            # минула. Спробуємо ще раз за хвилину.
+                            log.warning("зняття загрози НЕ надіслано — "
+                                       "ціль залишаю активною до наступної "
+                                       "спроби")
+
+                # Те саме, але для «поруч» (сусіднє село) — раніше такі
+                # цілі взагалі не знімались: «загроза минула» про них
+                # ніколи не приходила, і незрозуміло було, чи ще актуально.
+                if config.CLEAR_THREAT and self.near_threat:
+                    quiet = datetime.now() - self.near_threat["last_seen"]
+                    if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
+                        sent = await self._announce(
+                            format_gone(self.near_threat, ""))
+                        if sent:
+                            log.info("ціль «поруч» знята за мовчанням "
+                                    "каналів (%d хв)", config.CLEAR_AFTER_MIN)
+                            self.near_threat = None
+                        else:
+                            log.warning("зняття цілі «поруч» НЕ надіслано "
+                                       "— залишаю активною до наступної "
+                                       "спроби")
             except Exception:                                # noqa: BLE001
                 log.exception("_watch_threat впав на цій ітерації — "
                               "продовжую")

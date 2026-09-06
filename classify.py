@@ -197,6 +197,33 @@ NOT_OURS = ["бєлгород", "белгород", "бнр", "брянськ", 
             "курск", "московськ", "московск", "росі", "россии", "россия",
             "рф ", "крим", "крым", "воронеж", "ростов", "таганрог"]
 
+# Робота ППО САМЕ на боці ворога — «у них», «на тій стороні» (без
+# конкретного міста РФ) або пряма згадка ворожого регіону. Це НЕ наші
+# звуки і не привід мовчати: ворог часто пускає ракети впереміш із
+# перехопленими цілями саме тоді, коли в нього «працює ППО».
+ENEMY_SIDE = ["у них", "в них", "з їхнього боку", "з того боку",
+             "на тій стороні", "з боку ворога", "у ворога", "в ворога",
+             "в противника"] + NOT_OURS
+_ENEMY_PPO_MARKERS = ("працює ппо", "работает пво", "робота ппо",
+                     "работа пво")
+
+
+def enemy_pvo_state(text: str) -> str | None:
+    """Робота ППО на боці ворога — не тривога, але привід бути уважним:
+
+    у той самий час вороги можуть пускати ракети впереміш із цілями,
+    які саме перехоплює їхня ж ППО. Повертає текст або None.
+    """
+    body = clean(text)
+    if not body:
+        return None
+    low = body.lower()
+    if not any(m in low for m in _ENEMY_PPO_MARKERS):
+        return None
+    if not any(r in low for r in ENEMY_SIDE):
+        return None
+    return body
+
 
 # Проліт балістики над областю: гуркіт є, загрози саме нам немає.
 TRANSIT = ["проліт балістик", "пролет баллистик", "пролёт баллистик",
@@ -769,6 +796,21 @@ def classify(text: str) -> dict | None:
             "places": ["Харківщина"], "threats": [], "text": body,
             "confidence": "high", "main_city": False, "near_home": False,
             "key": dedup_key("INFO", ["Харківщина"], ["проліт"], body),
+        }
+
+    # Робота ППО у ворога («у них», Бєлгород...) — не наші звуки, а
+    # ознака можливого пуску ракет впереміш. Перевіряємо ДО friendly_state,
+    # бо той самий вираз «работа пво» інакше зчитався б як «наша ППО».
+    if enemy_pvo_state(text):
+        return {
+            "level": "INFO",
+            "reason": "можлива підготовка пуску: працює ППО у ворога",
+            "places": ["Харківщина"] if (geo.find_oblast(low)
+                                         or any(h in low for h in OBLAST_HINT))
+                     else [],
+            "threats": [], "text": body, "confidence": "medium",
+            "main_city": False, "near_home": False, "watch": True,
+            "key": dedup_key("INFO", ["ворог-ппо"], ["ворог-ппо"], body),
         }
 
     planned = planned_works(text) if config.FILTER_PLANNED else None

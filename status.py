@@ -142,7 +142,7 @@ def build_text(stats: dict, started: datetime, last_alert, paused: bool,
     # Не уведомление: просто контекст, чтобы понимать общую картину.
     if oblast:
         note, link, when = oblast
-        if now - when < timedelta(minutes=40):
+        if now - when < timedelta(minutes=20):
             lines += [f"🛩 <b>По області:</b> {note} · "
                       f"<a href=\"{link}\">джерело</a> ({when:%H:%M})", ""]
 

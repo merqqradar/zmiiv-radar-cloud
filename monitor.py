@@ -217,6 +217,10 @@ def headline(res: dict) -> str:
 
     if res["level"] == "INFO":
         # Первым словом — суть: «ЗВУКИ НАШІ», «РОБОТА ППО»
+        # watch — окремий випадок («робота ППО у ворога»): жовтий,
+        # бо це не рутинна синя інфа, а привід бути уважним.
+        if res.get("watch"):
+            icon = "🟡"
         where = f" → {place}" if places else ""
         return f"{icon} <b>{res['reason'].upper()}{where}</b>"
 
@@ -252,6 +256,8 @@ def format_message(res: dict, channel: str, link: str, dup_src=None) -> str:
     підтвердження вирішувати вам.
     """
     icon, title = LEVEL_STYLE[res["level"]]
+    if res.get("watch"):
+        icon, title = "🟡", "Увага"
     places = ", ".join(res["places"]) or "—"
     top = headline(res)
 
@@ -1257,6 +1263,17 @@ class Radar:
             self.oblast = (summary[0], link, datetime.now())
             if self._status_dirty:
                 self._status_dirty.set()
+        elif self.oblast:
+            # Свіже повідомлення каже «чисто в області/районі» — старий
+            # підрахунок цілей у закріпленому вже не актуальний, навіть
+            # якщо він ще не старший за 20-хвилинне вікно показу. Раніше
+            # закріплене показувало застарілу кількість аж до таймауту.
+            area_gone = classify.threat_gone(text)
+            if area_gone and area_gone[0] in ("чисто в області",
+                                              "чисто в районі"):
+                self.oblast = None
+                if self._status_dirty:
+                    self._status_dirty.set()
 
         # Копимо, які типи загроз згадують канали: за ними визначаємо
         # тип там, де його не назвали.
@@ -1446,13 +1463,16 @@ class Radar:
                                           "last_seen": now_ts, "kind": kind,
                                           "last_src": src}
                 save_active_threat(self.active_threat)
-            elif res["level"] == "MEDIUM" and res.get("near_home"):
-                # «Поруч» (сусіднє село, ще не загроза місту) досі не
-                # мав власного закриття: на відміну від active_threat,
-                # він ніколи не знімався по тиші — «загроза минула» про
-                # такі цілі просто ніколи не приходила. Окремий, легший
-                # стан: не займає active_threat (інакше сусіднє село
-                # тихо підмінило б собою реальну ціль по місту).
+            elif res["level"] == "MEDIUM":
+                # «Поруч» (сусіднє село чи ціль курсом на віддалене село
+                # з дальнього поясу — near_home тут не обов'язково True)
+                # досі не мав власного закриття: на відміну від
+                # active_threat, він ніколи не знімався по тиші —
+                # «загроза минула» про такі цілі просто ніколи не
+                # приходила. Окремий, легший стан: не займає active_threat
+                # (інакше сусіднє село тихо підмінило б собою реальну
+                # ціль по місту). Умова тут ловить БУДЬ-яке MEDIUM, що не
+                # потрапило у гілку вище (main_city вже виключено там).
                 now_ts = datetime.now()
                 near_place = res["places"][0] if res["places"] else "поруч"
                 if self.near_threat and self.near_threat["place"] == near_place:

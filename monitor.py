@@ -80,7 +80,8 @@ def load_active_threat():
         raw = json.loads(ACTIVE_THREAT_FILE.read_text(encoding="utf-8"))
         threat = {"place": raw["place"],
                   "since": datetime.fromisoformat(raw["since"]),
-                  "last_seen": datetime.fromisoformat(raw["last_seen"])}
+                  "last_seen": datetime.fromisoformat(raw["last_seen"]),
+                  "kind": raw.get("kind", "")}
     except (json.JSONDecodeError, KeyError, ValueError):
         return None
     if datetime.now() - threat["last_seen"] > timedelta(hours=ALARM_MAX_HOURS):
@@ -95,6 +96,7 @@ def save_active_threat(threat) -> None:
     ACTIVE_THREAT_FILE.write_text(json.dumps({
         "place": threat["place"], "since": threat["since"].isoformat(),
         "last_seen": threat["last_seen"].isoformat(),
+        "kind": threat.get("kind", ""),
     }, ensure_ascii=False), encoding="utf-8")
 PREV_FILE = config.DATA_DIR / "daily_prev.json"
 
@@ -393,6 +395,7 @@ class Radar:
         self.last_false_alarm = None    # коли востаннє попередили про хибні цілі
         self.oblast = None              # (опис, посилання, час) — для закріпленого
         self.gone_votes = {}            # канали, що повідомили про зникнення цілі
+        self.radiation_votes = {}       # канали, що повідомили про радіаційну загрозу
         self.rockets = None             # (скільки, тип, час) — ракети в області
         self.pending_impact = None      # вибух без пояснення: чекаємо уточнення
         self.recent_types = []          # (час, тип) — щоб визначати невідомі загрози
@@ -493,14 +496,15 @@ class Radar:
                         main = geo.main_name()
                         place = main if main in res["places"] else (
                             res["places"][0] if res["places"] else main)
-                        found = (msg.date, place)
+                        kind = res["threats"][0][0] if res["threats"] else ""
+                        found = (msg.date, place, kind)
             except Exception as e:                       # noqa: BLE001
                 log.warning("не вдалося прочитати %s при відновленні цілі: %s",
                             channel, type(e).__name__)
 
         if not found:
             return
-        when, place = found
+        when, place, kind = found
         local = when.astimezone().replace(tzinfo=None)
 
         # Якщо ціль уже застаріла станом на момент відновлення (застосунок
@@ -514,7 +518,8 @@ class Radar:
                      local.strftime("%H:%M"))
             return
 
-        self.active_threat = {"place": place, "since": local, "last_seen": local}
+        self.active_threat = {"place": place, "since": local, "last_seen": local,
+                              "kind": kind}
         save_active_threat(self.active_threat)
         log.info("відновлено активну ціль: %s, останнє згадування о %s",
                  place, local.strftime("%H:%M"))
@@ -651,8 +656,15 @@ class Radar:
                     # передавався порожній контекст, і ця перевірка
                     # мовчки пропускалась — саме тому «не фіксується» про
                     # зовсім інше село помилково знімало загрозу місту.
+                    # expected_kind: якщо зараз активна конкретна зброя
+                    # (напр. Шахед), «не фіксується» про іншу зброю
+                    # (Бандероль) поруч не повинно рахуватись як зняття
+                    # нашої цілі — це просто інша ціль по сусідству.
                     reply_ctx = getattr(msg, "reply_text", None) or ""
-                    gone_hit = classify.threat_gone(msg.text, reply_ctx)
+                    expected_kind = (self.active_threat.get("kind", "")
+                                     if self.active_threat else "")
+                    gone_hit = classify.threat_gone(msg.text, reply_ctx,
+                                                    expected_kind)
                     if gone_hit:
                         gone_channels.add(channel)
                         if (city_gone_evidence is None
@@ -665,7 +677,13 @@ class Radar:
                     if res and res["level"] in ("HIGH", "MEDIUM"):
                         key = res.get("key")
                         is_new_key = key not in seen_keys
-                        if key:
+                        # Додаємо в seen_keys лише свіжі згадки: інакше
+                        # застаріла ракета з початку 40-хвилинного вікна
+                        # «займала» ключ, і справді свіжа згадка того
+                        # самого типу/місця від іншого каналу мовчки не
+                        # рахувалась — «зайнято», хоча насправді той
+                        # запис уже занадто старий, щоб на нього зважати.
+                        if key and msg.date >= fresh_cutoff:
                             seen_keys.add(key)
 
                         if res.get("main_city"):
@@ -1005,7 +1023,25 @@ class Radar:
                 key = classify.dedup_key("CIVIL", [name], [], body)
                 if not self.dedup.is_duplicate(key, date
                                                or datetime.now(timezone.utc)):
-                    msg = (f"{emoji} <b>{name.upper()}</b>\n"
+                    # Радіаційна загроза — це серйозно, і саме тому
+                    # найлегше сплутати через одну помилку чи описку
+                    # першоджерела. Впевнено кричимо, лише коли
+                    # підтвердили два РІЗНІ канали протягом години;
+                    # від одного каналу — обережне «можливо».
+                    head = name.upper()
+                    if name == "Радіаційна загроза":
+                        now_ts = datetime.now()
+                        self.radiation_votes[username] = now_ts
+                        votes = len([t for t in self.radiation_votes.values()
+                                    if now_ts - t < timedelta(hours=1)])
+                        if votes < 2:
+                            head = f"МОЖЛИВО: {name.upper()}"
+                            log.info("радіаційна загроза: 1 канал (%s) — "
+                                    "«можливо»", username)
+                        else:
+                            log.info("радіаційна загроза: %d канали "
+                                    "підтвердили", votes)
+                    msg = (f"{emoji} <b>{head}</b>\n"
                            f"{emoji} Інше · не повітряна загроза\n"
                            f"\n{escape(body)[:500]}\n"
                            f"\n<i>{escape(username)}</i> · "
@@ -1076,9 +1112,10 @@ class Radar:
                          "— пропускаю", username)
         if config.CLEAR_THREAT and self.active_threat:
             # classify.threat_gone сам перевіряє релевантність контексту
-            # (Зміїв / ближній круг / район) — цього досить, не треба
-            # дублювати перевірку тут ще раз.
-            gone = classify.threat_gone(text, context)
+            # (Зміїв / ближній круг / район) і тип зброї (expected_kind) —
+            # без другого шахед і бандероль поруч гасили б одне одного.
+            gone = classify.threat_gone(text, context,
+                                        self.active_threat.get("kind", ""))
             if gone:
                 other_region = geo.mentions_other_region(text.lower())
                 log.info("gone-сигнал від %s: %s (враховано: %s)",
@@ -1213,6 +1250,22 @@ class Radar:
         if self.dedup.is_duplicate(res["key"], when):
             self.stats["dupes"] += 1
             log.info("дубль (%s) — пропуск: %s", res["level"], res["text"][:60])
+            # Дубль не шлемо в канал, але це РЕАЛЬНА, свіжа згадка тієї
+            # самої цілі — якщо цю ж ціль зараз стежимо, оновлюємо
+            # last_seen. Без цього при частих повторах (кожні 1-3 хв,
+            # усі в межах вікна дедуплікації) активна ціль «протухала» б
+            # за лічені хвилини, хоча канали пишуть про неї безперервно —
+            # саме так кнопка «Оновити» одного разу зняла загрозу одразу
+            # після свіжого повідомлення про ту саму ракету.
+            if self.active_threat and (
+                    res["level"] == "HIGH"
+                    or (res["level"] == "MEDIUM" and res.get("main_city"))):
+                main = geo.main_name()
+                place = main if main in res["places"] else (
+                    res["places"][0] if res["places"] else main)
+                if self.active_threat["place"] == place:
+                    self.active_threat["last_seen"] = datetime.now()
+                    save_active_threat(self.active_threat)
             return
 
         # HIGH — со звуком, остальное тихо. В тихие часы звук снимается
@@ -1271,11 +1324,18 @@ class Radar:
                 main = geo.main_name()
                 place = main if main in res["places"] else (
                     res["places"][0] if res["places"] else main)
+                kind = res["threats"][0][0] if res["threats"] else ""
                 if self.active_threat and self.active_threat["place"] == place:
                     self.active_threat["last_seen"] = now_ts
+                    # Тип не перезаписуємо, якщо він уже відомий: інакше
+                    # згадка іншої зброї в тому самому місці (шахед і
+                    # бандероль поруч) тихо підмінила б собою першу ціль,
+                    # і «не фіксується» про НОВУ зброю знімало б СТАРУ.
+                    if not self.active_threat.get("kind"):
+                        self.active_threat["kind"] = kind
                 else:
                     self.active_threat = {"place": place, "since": now_ts,
-                                          "last_seen": now_ts}
+                                          "last_seen": now_ts, "kind": kind}
                 save_active_threat(self.active_threat)
             if res.get("main_city"):
                 self.last_alert = (datetime.now(), res["level"],

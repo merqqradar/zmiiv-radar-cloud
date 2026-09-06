@@ -549,6 +549,23 @@ class Radar:
 
                 if config.CLEAR_THREAT and self.active_threat:
                     city_gone = self.review.get("city_gone")
+                    # Сигнал зняття повинен бути НОВІШИЙ за останню відому
+                    # згадку цілі — інакше стара «не фіксується» з початку
+                    # 40-хвилинного вікна (про попередній, уже завершений
+                    # епізод) могла б зняти щойно оголошену нову тривогу,
+                    # яка почалась ПІЗНІШЕ за цей допис. Так одного разу
+                    # загроза «знялася» за 10 хвилин ДО того, як реально
+                    # оголосили нову.
+                    when = self.review.get("city_gone_when")
+                    if city_gone and when:
+                        when_local = when.astimezone().replace(tzinfo=None)
+                        if when_local <= self.active_threat["last_seen"]:
+                            city_gone = False
+                            log.info("gone-сигнал з огляду застарів "
+                                    "(%s ⩽ останньої згадки %s) — ігнорую",
+                                    when_local.strftime("%H:%M"),
+                                    self.active_threat["last_seen"]
+                                    .strftime("%H:%M"))
                     quiet = (datetime.now() - self.active_threat["last_seen"])
                     silent_enough = quiet > timedelta(
                         minutes=config.CLEAR_AFTER_MIN)
@@ -595,7 +612,7 @@ class Radar:
                 "oblast_link": None, "oblast_when": None,
                 "city_last_seen": None, "city_gone": False,
                 "city_gone_wording": "", "city_gone_text": "",
-                "city_gone_link": None}
+                "city_gone_link": None, "city_gone_when": None}
         if not self.client:
             return data
 
@@ -746,11 +763,12 @@ class Radar:
         # контекст сам згадує місто (city_gone_evidence) — інакше це
         # могло стосуватись іншого села, куди ціль устигла піти.
         if city_gone_evidence:
-            wording, text, channel, msg_id, _when = city_gone_evidence
+            wording, text, channel, msg_id, when = city_gone_evidence
             data["city_gone"] = True
             data["city_gone_wording"] = wording
             data["city_gone_text"] = text
             data["city_gone_link"] = (channel, f"https://t.me/{channel}/{msg_id}")
+            data["city_gone_when"] = when
 
         # Ракети в області: рахуємо лише свіжі (не старші за
         # CLEAR_AFTER_MIN — якщо про них уже 10+ хвилин ніхто не пише,
@@ -1116,11 +1134,20 @@ class Radar:
             # без другого шахед і бандероль поруч гасили б одне одного.
             gone = classify.threat_gone(text, context,
                                         self.active_threat.get("kind", ""))
+            # Допис старіший за останню відому згадку цілі — стосується
+            # попереднього, вже завершеного епізоду, а не щойно
+            # оголошеної нової тривоги. Рідкісний випадок (канал з
+            # затримкою публікації), але саме так одного разу «зняття»
+            # прийшло раніше за саму тривогу.
+            stale = False
+            if gone and date:
+                msg_local = date.astimezone().replace(tzinfo=None)
+                stale = msg_local <= self.active_threat["last_seen"]
             if gone:
                 other_region = geo.mentions_other_region(text.lower())
                 log.info("gone-сигнал від %s: %s (враховано: %s)",
-                         username, gone[0], not other_region)
-            if gone and not geo.mentions_other_region(text.lower()):
+                         username, gone[0], not other_region and not stale)
+            if gone and not geo.mentions_other_region(text.lower()) and not stale:
                 self.gone_votes[username] = datetime.now()
                 votes = len([t for t in self.gone_votes.values()
                              if datetime.now() - t < timedelta(minutes=15)])

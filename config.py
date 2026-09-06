@@ -107,6 +107,7 @@ REVIEW_MINUTES = _S["review_minutes"]
 REVIEW_LIMIT = _S["review_limit"]
 SMART_EXPLAIN = _S["smart_explain"]
 SMART_BEFORE_SERIES = _S["smart_before_series"]
+DUP_NOTICE_ENABLED = _S["dup_notice_enabled"]
 ROLE = _S["role"]
 OWNER_ID = _S["owner_id"]
 
@@ -166,7 +167,7 @@ def reload_settings() -> dict:
     global TYPES_LOUD, TYPES_SILENT, TYPES_PINNED, TYPES_REPLACE
     global FILTER_PLANNED, FILTER_CONFIDENCE, FILTER_VOTES, FILTER_CONTEXT
     global SMART_REVIEW, REVIEW_MINUTES, REVIEW_LIMIT
-    global SMART_EXPLAIN, SMART_BEFORE_SERIES
+    global SMART_EXPLAIN, SMART_BEFORE_SERIES, DUP_NOTICE_ENABLED
     global ROLE, OWNER_ID, TELEGRAM_CONTROL, TARGET_CHAT_ID, BOT_TOKEN
     global CITY_2_ON, CITY_3_ON
     global CITY_MAIN_NAME, CITY_MAIN_VARIANTS, CITY_2_NAME, CITY_2_VARIANTS
@@ -210,6 +211,7 @@ def reload_settings() -> dict:
     REVIEW_LIMIT = s["review_limit"]
     SMART_EXPLAIN = s["smart_explain"]
     SMART_BEFORE_SERIES = s["smart_before_series"]
+    DUP_NOTICE_ENABLED = s["dup_notice_enabled"]
     ROLE = s["role"]
     OWNER_ID = s["owner_id"]
     TARGET_CHAT_ID = (s.get("target_chat_id") or "").strip() or \

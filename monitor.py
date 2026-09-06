@@ -59,6 +59,10 @@ ALARM_MAX_HOURS = 6
 # компроміс, потрібний, щоб не тягнути файл сесії на сторонній хостинг.
 CLOUD_POLL_SECONDS = 20
 
+# Скільки хвилин вважати попереднє повідомлення про те саме місце
+# «підозріло свіжим» для позначки можливого дубляжу з іншого каналу.
+DUP_NOTICE_WINDOW_MIN = 8
+
 # Состояние тревоги переживает перезапуск приложения: иначе после
 # обновления или перезагрузки закреплённое сообщение показывало бы
 # «загроз немає» посреди настоящей тривоги.
@@ -239,8 +243,14 @@ def plain_headline(res: dict) -> str:
     return headline(res).replace("<b>", "").replace("</b>", "")
 
 
-def format_message(res: dict, channel: str, link: str) -> str:
-    """Полный текст уведомления."""
+def format_message(res: dict, channel: str, link: str, dup_src=None) -> str:
+    """Полный текст уведомления.
+
+    dup_src — (канал, посилання) попереднього повідомлення про, схоже,
+    ту саму ціль з ІНШОГО каналу за останні кілька хвилин. Радар не
+    об'єднує цілі (це ризиковано), а лише попереджає — без 100%
+    підтвердження вирішувати вам.
+    """
     icon, title = LEVEL_STYLE[res["level"]]
     places = ", ".join(res["places"]) or "—"
     top = headline(res)
@@ -266,6 +276,13 @@ def format_message(res: dict, channel: str, link: str) -> str:
             and config.FILTER_CONFIDENCE):
         head += ("<i>⚠️ Радар не впевнений: у повідомленні немає прямої "
                  "згадки міста або типу загрози. Перевірте джерело.</i>\n")
+
+    if dup_src:
+        dup_channel, dup_link = dup_src
+        head += (f"<i>⚠️ Можливо, це та сама ціль, що вже згадувалась "
+                f"нещодавно в іншому каналі — "
+                f"<a href=\"{dup_link}\">{escape(dup_channel)}</a>. "
+                f"100% підтвердження немає, перевірте самі.</i>\n")
 
     return (f"{head}"
             f"<b>НП:</b> {escape(places)}\n"
@@ -407,6 +424,7 @@ class Radar:
         self.daily = load_daily()       # лічильники за добу
         self.critical = None            # епізод особливої небезпеки
         self.recent_high = []           # часи гучних сповіщень (для серії)
+        self.recent_alerts = []         # (час, канал, посилання) — для позначки можливого дубляжу
         self._wake_reason = None        # чому оновлюємо закріплене
         self.standby = False            # резерв мовчить, поки живий онлайн
         self.mute_until = None          # тиша на годину: звук тимчасово вимкнено
@@ -1336,6 +1354,24 @@ class Radar:
                     save_active_threat(self.active_threat)
             return
 
+        # Можливий дубляж з іншого каналу: та сама ціль (місто чи сусіднє
+        # село) уже згадувалась нещодавно, просто з іншого джерела.
+        # Радар НЕ об'єднує цілі (це ризиковано й може помилятись) —
+        # лише додає позначку в текст і не рахує подію в серію для
+        # «Особливої небезпеки», щоб кілька каналів, які пишуть про
+        # одну ціль, самі не викликали зайву серію гучних повторів.
+        dup_src = None
+        relevant = res["level"] in ("HIGH", "MEDIUM") and (
+            res.get("main_city") or res.get("near_home"))
+        if config.DUP_NOTICE_ENABLED and relevant:
+            now_check = datetime.now()
+            self.recent_alerts = [a for a in self.recent_alerts if now_check
+                                  - a[0] < timedelta(minutes=DUP_NOTICE_WINDOW_MIN)]
+            for _when, a_channel, a_link in self.recent_alerts:
+                if a_channel != username:
+                    dup_src = (a_channel, a_link)
+                    break
+
         # HIGH — со звуком, остальное тихо. В тихие часы звук снимается
         # и с HIGH: сообщение приходит, но не будит.
         # Зі звуком — лише коли радар упевнений. Невпевнений висновок
@@ -1347,8 +1383,10 @@ class Radar:
                   or config.in_quiet_hours(datetime.now().hour)
                   or self.is_muted())
         ok, info = await asyncio.to_thread(
-            notify.send, format_message(res, username, link), silent)
+            notify.send, format_message(res, username, link, dup_src), silent)
         if ok:
+            if relevant:
+                self.recent_alerts.append((datetime.now(), username, link))
             self.stats["sent"] += 1
             self.counts[res["level"]] += 1
             # Запоминаем конкретную цель, чтобы потом сообщить, когда
@@ -1417,7 +1455,9 @@ class Radar:
                 now_ts = datetime.now()
                 self.recent_high = [t for t in self.recent_high
                                     if now_ts - t < timedelta(minutes=10)]
-                if res.get("main_city"):
+                # dup_src — підозра, що це не нова ціль, а той самий
+                # об'єкт з іншого каналу: не рахуємо в серію повторів.
+                if res.get("main_city") and not dup_src:
                     self.recent_high.append(now_ts)
                 series = (len(self.recent_high) >= config.CRITICAL_SERIES
                           and res.get("main_city"))

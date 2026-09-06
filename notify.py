@@ -109,11 +109,15 @@ REFRESH_BUTTON = {"inline_keyboard": [[{"text": "🔄 Оновити",
 
 # Панель управления в личной переписке с ботом. Доступна только владельцу.
 def control_panel(paused: bool, muted: bool = False,
-                  smart: bool = True, online: bool = False) -> dict:
+                  smart: bool = True, online: bool = False,
+                  smart_button: bool = True) -> dict:
     """Панель управления в личной переписке. Доступна только владельцу.
 
     online — де зараз активна робота: True — на хмарі (Онлайн),
     False — на цьому пристрої (Локально). Активний варіант позначений ✅.
+    smart_button — чи кнопка «Оновити» під закріпленим робить повний
+    смарт-огляд каналів, чи просто перемальовує час (окремо від
+    загального перемикача «Розумні фільтри» нижче).
     """
     return {"inline_keyboard": [
         [{"text": "▶️ Відновити" if paused else "⏸ Пауза",
@@ -131,6 +135,9 @@ def control_panel(paused: bool, muted: bool = False,
         [{"text": "🔄 Оновити статус", "callback_data": "ctl:status"},
          {"text": "🔎 Смарт-звіт у канал", "callback_data": "ctl:review"}],
         [{"text": "📌 Новий закріп", "callback_data": "ctl:renew"}],
+        [{"text": "🔎 Кнопка «Оновити»: смарт-режим" if smart_button
+                  else "🔄 Кнопка «Оновити»: просте оновлення",
+          "callback_data": "ctl:smart_button"}],
         [{"text": "🧠 Розумні фільтри: увімк" if smart
                   else "⚠️ Розумні фільтри: ВИМК",
           "callback_data": "ctl:smart"}],

@@ -176,6 +176,8 @@ PANEL_HELP = """🎛 <b>Керування радаром</b>
 
 ✅ <b>Перевірка зв'язку</b> — надсилає в канал тестове повідомлення.
 
+🔎 <b>Кнопка «Оновити»: смарт-режим</b> — увімкнено (типово): кнопка «Оновити» під закріпленим переглядає останні повідомлення каналів і сама вирішує, чи знята ціль. Вимкнено — кнопка просто перемальовує час, як стара версія, без жодного аналізу.
+
 <i>Команди: /panel /pause /resume /mute /report /status /state
 /local /online /restart_cloud
 Кнопки працюють, поки радар запущений.</i>"""
@@ -544,7 +546,13 @@ class Radar:
         підтвердженням або за-справжньою тривалою тишею.
         """
         try:
-            if config.SMART_REVIEW:
+            if not config.SMART_REVIEW:
+                # Вимкнено — кнопка лише перемальовує час, без огляду.
+                # Без цього старий мінізвіт від попереднього натискання
+                # (коли смарт-режим ще був увімкнений) висів би в
+                # закріпленому й далі, до найближчого планового оновлення.
+                self.review = None
+            else:
                 self.review = await self._smart_review()
 
                 if config.CLEAR_THREAT and self.active_threat:
@@ -1610,7 +1618,8 @@ class Radar:
                 notify.send_to, chat_id, PANEL_HELP,
                 notify.control_panel(self.paused, self.is_muted(),
                                      config.FILTER_PLANNED,
-                                     config.cloud_active()))
+                                     config.cloud_active(),
+                                     config.SMART_REVIEW))
         elif text.startswith("/mute"):
             self.mute_until = datetime.now() + timedelta(hours=1)
             await asyncio.to_thread(notify.send_to, chat_id,
@@ -1691,7 +1700,8 @@ class Radar:
                 f"{reply}\n<i>{datetime.now():%H:%M}</i>",
                 notify.control_panel(self.paused, self.is_muted(),
                                      config.FILTER_PLANNED,
-                                     config.cloud_active()))
+                                     config.cloud_active(),
+                                     config.SMART_REVIEW))
         elif action == "mute":
             if self.is_muted():
                 self.mute_until = None
@@ -1703,7 +1713,8 @@ class Radar:
                 notify.send_to, chat_id, reply,
                 notify.control_panel(self.paused, self.is_muted(),
                                      config.FILTER_PLANNED,
-                                     config.cloud_active()))
+                                     config.cloud_active(),
+                                     config.SMART_REVIEW))
 
         elif action == "review":
             data = await self._smart_review()
@@ -1725,6 +1736,27 @@ class Radar:
                 self._status_dirty.set()
             reply = "📌 Створюю нове закріплене"
 
+        elif action == "smart_button":
+            # Окремий перемикач лише для кнопки «Оновити» під закрі-
+            # пленим: вимкнено — вона просто перемальовує час, як
+            # раніше, без повного огляду каналів. На відміну від
+            # «Розумні фільтри» нижче — той перемикач чіпає ще й live-
+            # обробку кожного повідомлення (planned/confidence/votes/
+            # context), а цей — лише поведінку самої кнопки.
+            saved = settings.load()
+            new_value = not saved.get("smart_review", True)
+            saved["smart_review"] = new_value
+            settings.save(saved)
+            config.reload_settings()
+            reply = ("🔎 Кнопка «Оновити»: смарт-режим увімкнено"
+                     if new_value else
+                     "🔄 Кнопка «Оновити»: тепер просте оновлення")
+            await asyncio.to_thread(
+                notify.send_to, chat_id, reply,
+                notify.control_panel(self.paused, self.is_muted(),
+                                     config.FILTER_PLANNED,
+                                     config.cloud_active(), new_value))
+
         elif action == "smart":
             # Разом вмикає або вимикає всі розумні фільтри — на випадок,
             # якщо котрийсь із них почне заважати.
@@ -1742,7 +1774,7 @@ class Radar:
             await asyncio.to_thread(
                 notify.send_to, chat_id, reply,
                 notify.control_panel(self.paused, self.is_muted(), new_value,
-                                     config.cloud_active()))
+                                     config.cloud_active(), new_value))
 
         elif action == "test":
             ok, info = await asyncio.to_thread(

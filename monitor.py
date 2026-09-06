@@ -78,10 +78,12 @@ def load_active_threat():
         return None
     try:
         raw = json.loads(ACTIVE_THREAT_FILE.read_text(encoding="utf-8"))
+        last_src = raw.get("last_src")
         threat = {"place": raw["place"],
                   "since": datetime.fromisoformat(raw["since"]),
                   "last_seen": datetime.fromisoformat(raw["last_seen"]),
-                  "kind": raw.get("kind", "")}
+                  "kind": raw.get("kind", ""),
+                  "last_src": tuple(last_src) if last_src else None}
     except (json.JSONDecodeError, KeyError, ValueError):
         return None
     if datetime.now() - threat["last_seen"] > timedelta(hours=ALARM_MAX_HOURS):
@@ -97,6 +99,7 @@ def save_active_threat(threat) -> None:
         "place": threat["place"], "since": threat["since"].isoformat(),
         "last_seen": threat["last_seen"].isoformat(),
         "kind": threat.get("kind", ""),
+        "last_src": list(threat["last_src"]) if threat.get("last_src") else None,
     }, ensure_ascii=False), encoding="utf-8")
 PREV_FILE = config.DATA_DIR / "daily_prev.json"
 
@@ -313,15 +316,29 @@ def format_gone(threat: dict, wording: str, source: str = "", src=None) -> str:
     """
     when = threat["since"]
     head = f"🟢 <b>{threat['place'].upper()} · ЗАГРОЗА, СКОРІШЕ ЗА ВСЕ, МИНУЛА</b>\n"
+    last_src = threat.get("last_src")
     if source:
         body = (f"🟢 {wording.capitalize()} · загроза була о {when:%H:%M}\n"
                 f"\n{escape(source)[:250]}")
-        return head + body + source_line(src)
+        tail = source_line(src)
+        # Якщо є ще й джерело ОСТАННЬОЇ згадки цілі (до цього «не
+        # фіксується») і воно не те саме повідомлення — додаємо і його:
+        # так можна вручну звірити, що обидва допису дійсно про одну й
+        # ту саму ціль.
+        if last_src and tuple(last_src) != tuple(src or ()):
+            tail += (f"\n<i>Востаннє згадувалась:</i> "
+                    f"<a href=\"{last_src[1]}\">{escape(last_src[0])}</a>")
+        return head + body + tail
 
     body = (f"🟢 Ціль більше не згадується · була о {when:%H:%M}\n"
             f"\nКанали перестали про неї писати. Могла пролетіти далі, "
             f"бути збитою або вже влучити. Це не офіційний відбій.")
-    return head + body + "\n\n<i>висновок радара: мовчання каналів</i>"
+    # Джерело ОСТАННЬОЇ згадки — щоб можна було вручну перевірити, чи
+    # справді ціль зникла, а не радар щось проґавив. Без цього мовчазне
+    # зняття не давало жодного посилання взагалі.
+    last_src = threat.get("last_src")
+    tail = source_line(last_src) if last_src else ""
+    return head + body + tail + "\n\n<i>висновок радара: мовчання каналів</i>"
 
 
 def format_short(text: str, place_time, src=None) -> str:
@@ -499,14 +516,15 @@ class Radar:
                         place = main if main in res["places"] else (
                             res["places"][0] if res["places"] else main)
                         kind = res["threats"][0][0] if res["threats"] else ""
-                        found = (msg.date, place, kind)
+                        link = f"https://t.me/{channel}/{msg.id}"
+                        found = (msg.date, place, kind, (channel, link))
             except Exception as e:                       # noqa: BLE001
                 log.warning("не вдалося прочитати %s при відновленні цілі: %s",
                             channel, type(e).__name__)
 
         if not found:
             return
-        when, place, kind = found
+        when, place, kind, last_src = found
         local = when.astimezone().replace(tzinfo=None)
 
         # Якщо ціль уже застаріла станом на момент відновлення (застосунок
@@ -521,7 +539,7 @@ class Radar:
             return
 
         self.active_threat = {"place": place, "since": local, "last_seen": local,
-                              "kind": kind}
+                              "kind": kind, "last_src": last_src}
         save_active_threat(self.active_threat)
         log.info("відновлено активну ціль: %s, останнє згадування о %s",
                  place, local.strftime("%H:%M"))
@@ -590,14 +608,19 @@ class Radar:
                                 self.review.get("city_gone_text", ""), src)
                         else:
                             msg = format_gone(self.active_threat, "")
-                        await self._announce(msg)
-                        log.info("загроза знята за смарт-перевіркою (кнопка, "
-                                "%s)", "явне «не фіксується»" if city_gone
-                                else f"мовчання {config.CLEAR_AFTER_MIN} хв")
-                        self.active_threat = None
-                        save_active_threat(None)
-                        self.last_alert = None
-                        self.critical = None
+                        sent = await self._announce(msg)
+                        if sent:
+                            log.info("загроза знята за смарт-перевіркою "
+                                    "(кнопка, %s)",
+                                    "явне «не фіксується»" if city_gone
+                                    else f"мовчання {config.CLEAR_AFTER_MIN} хв")
+                            self.active_threat = None
+                            save_active_threat(None)
+                            self.last_alert = None
+                            self.critical = None
+                        else:
+                            log.warning("зняття загрози НЕ надіслано — "
+                                       "ціль залишаю активною")
         except Exception:                                   # noqa: BLE001
             log.exception("огляд каналів не вдався")
             self.review = None
@@ -1170,13 +1193,22 @@ class Radar:
                         + source_line(src))
                     log.info("зняття загрози: 1 голос (%s)", username)
                 else:
-                    await self._announce(format_gone(self.active_threat,
-                                                     gone[0], gone[1], src=src))
-                    log.info("знято загрозу: %d канали підтвердили", votes)
-                    self.active_threat = None
-                    save_active_threat(None)
-                    self.last_alert = None
-                    self.gone_votes.clear()
+                    sent = await self._announce(format_gone(
+                        self.active_threat, gone[0], gone[1], src=src))
+                    if sent:
+                        log.info("знято загрозу: %d канали підтвердили", votes)
+                        self.active_threat = None
+                        save_active_threat(None)
+                        self.last_alert = None
+                        self.gone_votes.clear()
+                    else:
+                        # Якщо повідомлення не пішло (збій мережі,
+                        # standby) — НЕ знімаємо ціль мовчки: інакше
+                        # закріплене показало б «загроз немає», а в чат
+                        # ніхто так і не дізнався б, що загроза минула.
+                        # Спробуємо ще раз при наступній згадці/тіку.
+                        log.warning("зняття загрози НЕ надіслано — "
+                                   "ціль залишаю активною до наступної спроби")
                 if self._status_dirty:
                     self._status_dirty.set()
                 return
@@ -1300,6 +1332,7 @@ class Radar:
                     res["places"][0] if res["places"] else main)
                 if self.active_threat["place"] == place:
                     self.active_threat["last_seen"] = datetime.now()
+                    self.active_threat["last_src"] = src
                     save_active_threat(self.active_threat)
             return
 
@@ -1362,6 +1395,7 @@ class Radar:
                 kind = res["threats"][0][0] if res["threats"] else ""
                 if self.active_threat and self.active_threat["place"] == place:
                     self.active_threat["last_seen"] = now_ts
+                    self.active_threat["last_src"] = src
                     # Тип не перезаписуємо, якщо він уже відомий: інакше
                     # згадка іншої зброї в тому самому місці (шахед і
                     # бандероль поруч) тихо підмінила б собою першу ціль,
@@ -1370,7 +1404,8 @@ class Radar:
                         self.active_threat["kind"] = kind
                 else:
                     self.active_threat = {"place": place, "since": now_ts,
-                                          "last_seen": now_ts, "kind": kind}
+                                          "last_seen": now_ts, "kind": kind,
+                                          "last_src": src}
                 save_active_threat(self.active_threat)
             if res.get("main_city"):
                 self.last_alert = (datetime.now(), res["level"],
@@ -1524,15 +1559,24 @@ class Radar:
                     continue
                 quiet = datetime.now() - self.active_threat["last_seen"]
                 if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
-                    await self._announce(format_gone(self.active_threat, ""))
-                    log.info("загроза знята за мовчанням каналів (%d хв)",
-                             config.CLEAR_AFTER_MIN)
-                    self.active_threat = None
-                    save_active_threat(None)
-                    self.last_alert = None    # закріплене повертається у спокій
-                    self.critical = None
-                    if self._status_dirty:
-                        self._status_dirty.set()
+                    sent = await self._announce(
+                        format_gone(self.active_threat, ""))
+                    if sent:
+                        log.info("загроза знята за мовчанням каналів (%d хв)",
+                                 config.CLEAR_AFTER_MIN)
+                        self.active_threat = None
+                        save_active_threat(None)
+                        self.last_alert = None  # закріплене повертається у спокій
+                        self.critical = None
+                        if self._status_dirty:
+                            self._status_dirty.set()
+                    else:
+                        # Не знімаємо мовчки, якщо повідомлення не
+                        # пішло — інакше закріплене «заспокоїться», а в
+                        # чат ніхто так і не дізнається, що загроза
+                        # минула. Спробуємо ще раз за хвилину.
+                        log.warning("зняття загрози НЕ надіслано — "
+                                   "ціль залишаю активною до наступної спроби")
             except Exception:                                # noqa: BLE001
                 log.exception("_watch_threat впав на цій ітерації — "
                               "продовжую")

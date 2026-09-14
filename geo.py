@@ -24,8 +24,19 @@ from functools import lru_cache
 
 @lru_cache(maxsize=1024)
 def _pattern(roots: tuple):
-    """Регулярка «будь-який із коренів на початку слова»."""
-    return re.compile("|".join(r"(?<!\w)" + re.escape(r) for r in roots))
+    """Регулярка «будь-який із коренів на початку слова».
+
+    Додаємо українське чергування К→Ц у місцевому відмінку:
+    «Таранівка» → «у Таранівці», «Андріївка» → «в Андріївці».
+    Без цього «вибух у Таранівці» не впізнавався взагалі — корінь
+    «таранівк» не збігається з «таранівц», і село ближнього кола
+    просто випадало з поля зору.
+    """
+    full = list(roots)
+    for root in roots:
+        if root.endswith("к"):
+            full.append(root[:-1] + "ц")
+    return re.compile("|".join(r"(?<!\w)" + re.escape(r) for r in full))
 
 
 def _has(low: str, roots) -> bool:

@@ -73,6 +73,13 @@ SHORT_INTERVAL_SEC = 30
 # Скільки хвилин живуть голоси «у зведенні по області цілі немає».
 REPORT_VOTE_MIN = 15
 
+# Журнал подій доби: скільки записів тримаємо і скільки показуємо у звіті.
+EVENT_LOG_LIMIT = 60
+EVENT_SHOW_LIMIT = 8
+# За скільки годин назад уточнення «це було розмінування» ще стосується
+# вже записаного прильоту.
+EXPLAIN_IMPACT_HOURS = 4
+
 # Состояние тревоги переживает перезапуск приложения: иначе после
 # обновления или перезагрузки закреплённое сообщение показывало бы
 # «загроз немає» посреди настоящей тривоги.
@@ -678,6 +685,7 @@ class Radar:
         """
         data = {"when": datetime.now(), "channels": 0, "messages": 0,
                 "threats": 0, "oblast": 0, "near": 0, "by_type": {},
+                "threat_items": [],
                 "top": None, "top_when": None, "top_link": None,
                 "top_gone": False,
                 "oblast_link": None, "oblast_when": None,
@@ -804,6 +812,16 @@ class Radar:
                             if res.get("main_city"):
                                 if channel not in gone_channels:
                                     data["threats"] += 1
+                                    # Не лише число, а й ЩО саме: «загроз 2»
+                                    # без розшифровки перевірити ніяк.
+                                    data["threat_items"].append({
+                                        "t": msg.date.astimezone().strftime("%H:%M"),
+                                        "kind": (res["threats"][0][0]
+                                                 if res["threats"]
+                                                 else "тип не вказано"),
+                                        "ch": channel,
+                                        "link": f"https://t.me/{channel}/{msg.id}",
+                                    })
                             elif res.get("near_home"):
                                 data["near"] += 1
                             for name, _e in res["threats"]:
@@ -973,9 +991,62 @@ class Radar:
                                      encoding="utf-8")   # звіт за вчора
             self.daily = {"date": today, "seen": 0, "threats": 0, "impacts": 0,
                           "alarms": 0, "civil": {}, "by_type": {},
-                          "impact_types": {}}
+                          "impact_types": {}, "threat_log": [],
+                          "impact_log": []}
         self.daily[field] = self.daily.get(field, 0) + 1
         save_daily(self.daily)
+
+    def _log_event(self, field: str, kind: str, place: str, src) -> None:
+        """Записує подію в журнал доби: коли, що, де і ЗВІДКИ.
+
+        Без цього звіт казав лише «прильотів 2» — а де саме і за яким
+        повідомленням це порахувалось, перевірити було ніяк. Тепер під
+        кожним числом видно рядки з часом, місцем і посиланням на
+        першоджерело.
+        """
+        now = datetime.now()
+        entry = {"at": now.isoformat(timespec="seconds"),
+                 "t": now.strftime("%H:%M"),
+                 "kind": kind or "тип не вказано",
+                 "place": place or "—",
+                 "ch": src[0] if src else "",
+                 "link": src[1] if src else "",
+                 "note": "", "note_link": "", "note_ch": ""}
+        journal = self.daily.setdefault(field, [])
+        journal.append(entry)
+        del journal[:-EVENT_LOG_LIMIT]
+        save_daily(self.daily)
+
+    def _explain_impacts(self, text: str, src) -> None:
+        """Пізніше з'ясувалось, що вибух був плановим розмінуванням.
+
+        Канали спершу пишуть «вибух», радар чесно рахує це прильотом, і
+        лише через півгодини з'являється «це були планові підривні
+        роботи, щось пішло не за планом». Саме такий випадок і був.
+        Заднім числом позначаємо вже записані прильоти — обережно
+        («можливо») і з посиланням, щоб можна було звірити самому.
+        """
+        journal = self.daily.get("impact_log") or []
+        now = datetime.now()
+        marked = 0
+        for entry in journal:
+            if entry.get("note"):
+                continue
+            try:
+                when = datetime.fromisoformat(entry["at"])
+            except (ValueError, KeyError):
+                continue
+            if now - when > timedelta(hours=EXPLAIN_IMPACT_HOURS):
+                continue
+            entry["note"] = ("можливо, це були планові підривні роботи "
+                             "(розмінування), а не приліт")
+            entry["note_link"] = src[1] if src else ""
+            entry["note_ch"] = src[0] if src else ""
+            marked += 1
+        if marked:
+            save_daily(self.daily)
+            log.info("уточнення заднім числом: %d приліт(и) позначено як "
+                     "можливі планові підривні роботи", marked)
 
     def _bump_type(self, field: str, name: str) -> None:
         """Считает угрозы и прилёты по типам — для отчёта."""
@@ -1002,18 +1073,48 @@ class Radar:
             title = (f"📊 <b>ЗВІТ ЗА СЬОГОДНІ</b> · станом на "
                      f"{datetime.now():%H:%M}")
 
-        def block(caption, total, table):
+        def block(caption, total, table, journal=None, with_place=False):
+            """Число, розбивка за типами і сам перелік подій з джерелами.
+
+            Саме перелік і робить звіт перевірним: видно, о котрій,
+            що і де — і за яким повідомленням радар так вирішив.
+            """
             lines = [f"{caption} <b>{total}</b>"]
             for name, count in sorted(table.items(), key=lambda kv: -kv[1]):
                 lines.append(f"     └ {name.lower()}: {count}")
+            journal = journal or []
+            if not journal:
+                return lines
+            shown = journal[-EVENT_SHOW_LIMIT:]
+            if len(journal) > len(shown):
+                lines.append(f"     <i>(показано останні {len(shown)} з "
+                             f"{len(journal)})</i>")
+            for item in shown:
+                what = item.get("kind", "").lower()
+                where = f" · {escape(item.get('place', ''))}" if with_place else ""
+                src_txt = ""
+                if item.get("link"):
+                    src_txt = (f" · <a href=\"{item['link']}\">"
+                               f"{escape(item.get('ch') or 'джерело')}</a>")
+                lines.append(f"     • {item.get('t', '')} · "
+                             f"{escape(what)}{where}{src_txt}")
+                if item.get("note"):
+                    note_src = ""
+                    if item.get("note_link"):
+                        note_src = (f" · <a href=\"{item['note_link']}\">"
+                                    f"{escape(item.get('note_ch') or 'джерело')}</a>")
+                    lines.append(f"        ⚠️ <i>{escape(item['note'])}</i>"
+                                 f"{note_src}")
             return lines
 
         lines = [title, ""]
         lines += block("🔴 Загроз Змієву:", data.get("threats", 0),
-                       data.get("by_type") or {})
+                       data.get("by_type") or {},
+                       data.get("threat_log"))
         lines.append("")
         lines += block("💥 Прильотів поруч:", data.get("impacts", 0),
-                       data.get("impact_types") or {})
+                       data.get("impact_types") or {},
+                       data.get("impact_log"), with_place=True)
         lines += ["", f"🟡 Тривог по району: <b>{data.get('alarms', 0)}</b>"]
 
         civil = data.get("civil") or {}
@@ -1028,7 +1129,12 @@ class Radar:
                          f"з {self.alarm[1]:%H:%M}")
         lines.append("\n<i>Інформація орієнтовна: зібрана з Telegram-каналів "
                      "моніторингу й може містити неточності.</i>")
-        return "\n".join(lines)
+        text = "\n".join(lines)
+        # Telegram не приймає повідомлення довші за 4096 символів — у
+        # день з великою кількістю подій звіт просто не надіслався б.
+        if len(text) > 3900:
+            text = text[:3900].rsplit("\n", 1)[0] + "\n\n<i>…звіт скорочено</i>"
+        return text
 
     async def _handle(self, event) -> None:
         """Telethon-адаптер: дістає прості дані з event і йде в _ingest."""
@@ -1102,6 +1208,15 @@ class Radar:
                     save_state(None, self.announced)
                 if alarm_changed and self._status_dirty:
                     self._status_dirty.set()
+
+        # Канали пізніше пояснили вибух: це були планові підривні роботи.
+        # Перевіряємо ДО класифікації, бо саме таке повідомлення саме по
+        # собі сповіщення не дає (це INFO, який може бути вимкнений), а
+        # вже записаний «приліт» лишався б у звіті без пояснення.
+        if classify.planned_works(text) and (
+                geo.find_zmiiv(text.lower()) or geo.find_close(text.lower())
+                or geo.find_home_district(text.lower())):
+            self._explain_impacts(text, src)
 
         # Свет, вода, газ, химия, ДРГ, радиация — без звука.
         # Исключение: радиационная угроза, она со звуком.
@@ -1523,6 +1638,11 @@ class Radar:
                     self._bump_type("by_type", name)
                 if not res["threats"]:
                     self._bump_type("by_type", res.get("guess") or "невідомо")
+                self._log_event(
+                    "threat_log",
+                    res["threats"][0][0] if res["threats"]
+                    else (res.get("guess") or "тип не вказано"),
+                    geo.main_name(), src)
 
             # «Прильотів» — только если взрыв или прилёт случился
             # в самом городе, в его сёлах или в нашем районе.
@@ -1539,6 +1659,10 @@ class Radar:
                 self._bump("impacts")
                 for name, _emoji in res["threats"]:
                     self._bump_type("impact_types", name)
+                self._log_event(
+                    "impact_log",
+                    res["threats"][0][0] if res["threats"] else "вибух",
+                    (res["places"] or ["район"])[0], src)
 
             # Стан (активна ціль, заголовок закріпленого) виставляємо
             # ДО «особливої небезпеки» нижче: _raise_critical шле пачку

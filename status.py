@@ -60,6 +60,43 @@ def _types_line(data: dict) -> str:
     return ", ".join(parts[:4])
 
 
+def _count_kinds(items: list | None) -> dict:
+    """Рахує типи в переліку подій: [{kind: «Шахед»}, ...] -> {«Шахед»: 2}."""
+    table = {}
+    for item in items or []:
+        name = item.get("kind")
+        if name:
+            table[name] = table.get(name, 0) + 1
+    return table
+
+
+def _brief_types(table: dict | None) -> str:
+    """«(2 шахеди, 1 бандероль)» — коротка розшифровка числа загроз.
+
+    Саме число нічого не каже: «загроз 3» — це три шахеди чи ракета з
+    двома розвідниками? Тепер видно одразу, не відкриваючи звіт.
+    """
+    table = table or {}
+    if not table:
+        return ""
+    parts = [f"{count} {name.lower()}"
+             for name, count in sorted(table.items(), key=lambda kv: -kv[1])]
+    return " (" + ", ".join(parts[:3]) + ")"
+
+
+def _brief_places(journal: list | None) -> str:
+    """«(Слобожанське, Андріївка)» — де саме були прильоти."""
+    journal = journal or []
+    places = []
+    for item in journal:
+        place = item.get("place")
+        if place and place not in places:
+            places.append(place)
+    if not places:
+        return ""
+    return " (" + ", ".join(places[:3]) + ")"
+
+
 def format_review(data: dict, city: str, html: bool = True) -> str:
     """Мікрозвіт після натискання «Оновити». Один формат для каналу і застосунку."""
     b = (lambda t: f"<b>{t}</b>") if html else (lambda t: t)
@@ -69,12 +106,23 @@ def format_review(data: dict, city: str, html: bool = True) -> str:
         f"Основне місто: {city}",
         f"Перевірено каналів: {data['channels']}",
         f"Прочитано повідомлень: {data['messages']}",
-        f"Виявлено загроз місту: {data['threats']}",
+        f"Виявлено загроз місту: {data['threats']}"
+        + _brief_types({k: v for k, v in _count_kinds(
+            data.get("threat_items")).items()}),
         f"Цілей в області: {_types_line(data)}"
         + (f" · <a href=\"{data['oblast_link']}\">джерело</a>"
            if html and data.get("oblast_link") else ""),
         f"Поруч (сусідні НП): {data['near']}",
     ]
+    # Перелік самих загроз із посиланнями: щоб не вірити числу на слово,
+    # а могти відкрити кожне першоджерело й перевірити.
+    for item in (data.get("threat_items") or [])[:6]:
+        if html and item.get("link"):
+            lines.append(f"     • {item['t']} · {item['kind'].lower()} · "
+                         f"<a href=\"{item['link']}\">{item.get('ch', 'джерело')}</a>")
+        else:
+            lines.append(f"     • {item['t']} · {item['kind'].lower()}")
+
     if data.get("top"):
         when = data["top_when"].astimezone().strftime("%H:%M")
         # Канал сам написав «не фіксується» — не показуємо це як живу
@@ -155,8 +203,10 @@ def build_text(stats: dict, started: datetime, last_alert, paused: bool,
     lines += [
         f"<b>Оновлено:</b> {human_time(now)}"
         + (f" · {REASON_LABEL.get(reason, reason)}" if reason else ""),
-        f"<b>За добу:</b> загроз {daily.get('threats', 0)} · "
-        f"прильотів {daily.get('impacts', 0)} · "
+        f"<b>За добу:</b> загроз {daily.get('threats', 0)}"
+        f"{_brief_types(daily.get('by_type'))} · "
+        f"прильотів {daily.get('impacts', 0)}"
+        f"{_brief_places(daily.get('impact_log'))} · "
         f"переглянуто {daily.get('seen', 0)}",
         "",
         "<i>Збирає повідомлення кількох Telegram-каналів моніторингу, "

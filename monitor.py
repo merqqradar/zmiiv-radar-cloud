@@ -1551,8 +1551,26 @@ class Radar:
                             if self._status_dirty:
                                 self._status_dirty.set()
 
-        # Обстановка по області — тільки в закріплене, без сповіщень
-        summary = classify.oblast_summary(text)
+        # Обстановка по області — тільки в закріплене, без сповіщень.
+        # Спершу пробуємо порахувати за зведенням (шахеди, БпЛА — усе),
+        # бо oblast_summary нижче вимагає явного числа («10 шахедів»), а
+        # канали пишуть списком: «Шахеди: на Богодухів, 2 в районі
+        # Писарівки». Через це рядок «По області» не з'являвся зовсім,
+        # хоча смарт-перевірка ті самі цілі бачила.
+        summary = None
+        if config.SMART_READ and reader.area_report(text):
+            targets = reader.area_targets(text)
+            if targets:
+                by_kind = {}
+                for target in targets:
+                    by_kind[target["kind"]] = (by_kind.get(target["kind"], 0)
+                                               + target["count"])
+                summary = (", ".join(f"{v} × {k.lower()}"
+                                     for k, v in sorted(by_kind.items(),
+                                                        key=lambda kv: -kv[1])),
+                           sum(by_kind.values()))
+        if not summary:
+            summary = classify.oblast_summary(text)
         if summary:
             self.oblast = (summary[0], link, datetime.now())
             if self._status_dirty:

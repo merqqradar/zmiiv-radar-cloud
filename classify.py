@@ -16,7 +16,17 @@ import re
 
 import config
 import geo
+import reader
 import threats
+
+
+def retro_note(body: str):
+    """Чи це повідомлення про вже минулі події (reader.retrospective).
+
+    Винесено окремо, щоб було видно місце, де це враховується, і щоб
+    вимикалось разом із глибоким розбором.
+    """
+    return reader.retrospective(body)
 
 # Рекламные хвосты, которыми каналы заканчивают почти каждый пост.
 # Без вырезки они лезут в текст уведомления и ломают дедупликацию.
@@ -247,26 +257,6 @@ def enemy_pvo_state(text: str) -> str | None:
     return body
 
 
-# Проліт балістики над областю: гуркіт є, загрози саме нам немає.
-TRANSIT = ["проліт балістик", "пролет баллистик", "пролёт баллистик",
-           "транзит", "бабах", "ефект прольоту", "эффект пролета",
-           "пролетіла над областю", "пролетела над областью"]
-
-
-def transit_state(text: str):
-    """Проліт балістики / гуркіт без загрози. Повертає текст або None."""
-    body = clean(text)
-    if not body:
-        return None
-    low = body.lower()
-    if not any(m in low for m in TRANSIT):
-        return None
-    if not (geo.find_oblast(low) or geo.find_district(low)
-            or geo.find_zmiiv(low) or any(h in low for h in OBLAST_HINT)):
-        return None
-    return body
-
-
 # Планові підривні роботи, розмінування, навчання саперів.
 # Це НЕ приліт і не загроза: звуки вибухів будуть, але заплановані.
 # Саме через це радар одного разу назвав розмінування «наслідками
@@ -288,6 +278,12 @@ TRANSIT = ["проліт балістик", "пролет баллистик", "
            "транзит", "бабах", "ефект прольоту", "эффект пролета",
            "пролетіла над областю", "пролетела над областью"]
 
+# Слабкі маркери: самі по собі про проліт балістики не свідчать.
+# «2 шахеди в Дніпропетровській області транзитом через Далеке» —
+# це маршрут ЧУЖОЇ цілі, а радар читав це як «проліт балістики над
+# нашою областю» і глушив ним усе повідомлення.
+TRANSIT_WEAK = {"транзит", "бабах"}
+
 
 def transit_state(text: str):
     """Проліт балістики / гуркіт без загрози. Повертає текст або None."""
@@ -295,7 +291,16 @@ def transit_state(text: str):
     if not body:
         return None
     low = body.lower()
-    if not any(m in low for m in TRANSIT):
+    hits = [m for m in TRANSIT if m in low]
+    if not hits:
+        return None
+    # Лише слабкі маркери — потрібне пряме слово про балістику.
+    if all(h in TRANSIT_WEAK for h in hits) and not any(
+            w in low for w in ("баліст", "балист")):
+        return None
+    # Проліт над ЧУЖОЮ областю — не наша подія.
+    if geo.mentions_other_region(low) and not (geo.find_zmiiv(low)
+                                               or geo.find_close(low)):
         return None
     if not (geo.find_oblast(low) or geo.find_district(low)
             or geo.find_zmiiv(low) or any(h in low for h in OBLAST_HINT)):
@@ -808,6 +813,14 @@ def classify(text: str) -> dict | None:
     # районов, где тревога продолжается, к адресату отбоя не относится.
     geo_low = alert_head(body).lower()
 
+    # Новина про удар ПО ворогу («СБУ вночі вдарили по базі рф у
+    # Новоросійську») — не загроза Змієву. Такі дописи повні слів
+    # «ракета», «Калібр», «удар», і будь-який випадковий збіг назви
+    # робив з новини червону тривогу. Наше місто в тексті — виняток:
+    # тоді це вже не новина про ворога, і розбираємо як звичайно.
+    if config.SMART_READ and reader.foreign_strike(body):
+        return None
+
     # Районне оголошення тривоги з кольором/рівнем («...тривога, жовтий
     # рівень: Дронова загроза...») — це не окрема реальна ціль, а сама
     # тривога; alarm_state() її й так розбирає окремо (тихо, в
@@ -893,6 +906,24 @@ def classify(text: str) -> dict | None:
         return None
 
     found = threats.detect_threats(low)
+
+    # ГЛИБОКИЙ РОЗБІР. Канали пишуть списком, і тип загрози треба брати
+    # саме з ТОГО рядка, де назване наше село:
+    #     БпЛА від Борок на Таранівку     ← це наш рядок, це БпЛА
+    #     FPV-дрон над Безруками
+    #     БпЛА-розвідник біля Рубіжного   ← а це за 80 км
+    # Раніше тип шукався по всьому тексту одразу, і Таранівці
+    # діставався «розвідник» — просто тому, що він вище в таблиці типів.
+    #
+    # Застосовуємо лише до СПИСКІВ (два й більше пункти): звичайне
+    # повідомлення з одного речення читається як і раніше.
+    deep = None
+    if config.SMART_READ:
+        deep = reader.read(body)
+        if len(deep["items"]) >= 2 and deep["ours"]:
+            names = set(deep["types"])
+            found = [(n, e) for n, e in found if n in names]
+
     threat_names = [n for n, _ in found]
     # Артиллерия/обстрелы до Змієва не долетают — как признак воздушной
     # угрозы не годится. Разведывательные БпЛА и FPV тоже не повод будить:
@@ -1024,6 +1055,21 @@ def classify(text: str) -> dict | None:
     if digest and level == "HIGH":
         level = "MEDIUM"
         reason = "згадка у зведенні"
+        mass = None
+
+    # Ціль ВІДДАЛЯЄТЬСЯ: «від Змієва на Чугуїв» — вона вже пройшла над
+    # нами й іде далі. Раніше це читалось так само, як «від Чугуєва на
+    # Зміїв», і на кожен виліт від нас приходила зайва гучна тривога.
+    if deep and deep.get("outgoing") and level == "HIGH":
+        level = "MEDIUM"
+        reason = f"ціль віддаляється від {geo.main_name()}"
+        mass = None
+
+    # Минулий час: «вночі вдарили», «за минулу добу». Знати корисно,
+    # але будити повторами через те, що вже сталося, не можна.
+    if config.SMART_READ and level == "HIGH" and retro_note(body):
+        level = "MEDIUM"
+        reason = "про минулі події: " + reason
         mass = None
 
     return {

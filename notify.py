@@ -120,6 +120,9 @@ def control_panel(paused: bool, muted: bool = False,
     загального перемикача «Розумні фільтри» нижче).
     """
     return {"inline_keyboard": [
+        # Найперша кнопка: коли радар помилково підняв червону тривогу,
+        # шукати щось у списку ніколи — треба одразу її прибрати.
+        [{"text": "⚪️ Скасувати тривогу", "callback_data": "ctl:cancel_alarm"}],
         [{"text": "▶️ Відновити" if paused else "⏸ Пауза",
           "callback_data": "ctl:pause"},
          {"text": "🔔 Увімкнути звук" if muted else "🔕 Тиша на годину",

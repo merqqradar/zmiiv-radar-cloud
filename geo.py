@@ -9,6 +9,30 @@
 """
 
 import re
+from functools import lru_cache
+
+# --- Пошук коренів ПО МЕЖІ СЛОВА ---------------------------------------------
+# Раніше корені шукались простим «підрядок у тексті», і через це
+# «нафтовий термінал “Шесхаріс”» читався як село Есхар під Зміївом —
+# радар підняв червону тривогу на новину про удар по Новоросійську.
+# Так само «Шахтарське» ловилось як «Тарське», «Красноград» як «Град».
+#
+# Тепер корінь має починати СЛОВО: перед ним не може стояти літера.
+# Закінчення слова не перевіряємо — саме так ловляться відмінки:
+# «на Мерефу», «над Мерефою», «Зміївського».
+
+
+@lru_cache(maxsize=1024)
+def _pattern(roots: tuple):
+    """Регулярка «будь-який із коренів на початку слова»."""
+    return re.compile("|".join(r"(?<!\w)" + re.escape(r) for r in roots))
+
+
+def _has(low: str, roots) -> bool:
+    """Чи є в тексті хоч один корінь (на межі слова)."""
+    roots = tuple(roots)
+    return bool(roots) and bool(_pattern(roots).search(low))
+
 
 # --- Ядро: головне місто ------------------------------------------------------
 # Раніше тут був жорстко зашитий шаблон для Зміїва. Тепер місто береться
@@ -59,13 +83,12 @@ def reload_cities() -> None:
 def find_main(text: str) -> bool:
     """Чи згадане головне місто."""
     low = text.lower()
-    return any(root in low for root in CITIES.main)
+    return _has(low, CITIES.main)
 
 
 def find_extra(low: str) -> list:
     """Додаткові міста, згадані в тексті."""
-    return [name for name, roots in CITIES.extra
-            if any(root in low for root in roots)]
+    return [name for name, roots in CITIES.extra if _has(low, roots)]
 
 
 def main_name() -> str:
@@ -119,7 +142,7 @@ def find_near(low: str) -> list:
     """Ближний пояс. Учитывает слова-исключения для тёзок."""
     out = []
     for name, (roots, bad) in NEAR.items():
-        if any(r in low for r in roots) and not any(b in low for b in bad):
+        if _has(low, roots) and not any(b in low for b in bad):
             out.append(name)
     return out
 
@@ -174,8 +197,7 @@ def strip_directions(text: str) -> str:
 
 def _match(low: str, table: dict) -> list:
     """Ищет в тексте НП из таблицы. Возвращает список имён."""
-    return [name for name, roots in table.items()
-            if any(root in low for root in roots)]
+    return [name for name, roots in table.items() if _has(low, roots)]
 
 
 def find_close(low: str) -> list:
@@ -196,17 +218,17 @@ ZMIIV_DISTRICT = ["зміївськ", "змиевск", "зміївська гр
 
 def find_home_district(low: str) -> bool:
     """Саме Зміївський район / громада, а не весь Чугуївський."""
-    return any(r in low for r in ZMIIV_DISTRICT)
+    return _has(low, ZMIIV_DISTRICT)
 
 
 def find_district(low: str) -> bool:
     """Упомянут ли район, за которым следит радар."""
-    return any(r in low for r in _district_roots())
+    return _has(low, _district_roots())
 
 
 def find_oblast(low: str) -> bool:
     """Упомянута ли Харьковская область."""
-    return any(r in low for r in OBLAST)
+    return _has(low, OBLAST)
 
 
 # Тревога объявляется по районам. Наш — Чугуївський (Зміїв входит в него
@@ -226,14 +248,13 @@ def is_our_alarm_area(low: str) -> bool:
     Наши — Чугуївський/Зміївський район и объявления на всю область.
     Тревога по Харкову или Лозівському району к Зміїву отношения не имеет.
     """
-    if any(r in low for r in _district_roots()):
+    if _has(low, _district_roots()):
         return True
-    if any(r in low for r in OBLAST_ALONE):
+    if _has(low, OBLAST_ALONE):
         return True
-    return (any(r in low for r in OBLAST_ROOTS)
-            and any(w in low for w in OBLAST_WORDS))
+    return _has(low, OBLAST_ROOTS) and any(w in low for w in OBLAST_WORDS)
 
 
 def mentions_other_region(low: str) -> bool:
     """Сообщение про другую область — скорее всего не про нас."""
-    return any(r in low for r in OTHER_REGIONS)
+    return _has(low, OTHER_REGIONS)

@@ -140,16 +140,54 @@ def detect_threats(low: str) -> list:
                     if rx.search(low)]
 
 
+def find_types_with_pos(low: str) -> list:
+    """Знайдені типи разом із позицією в тексті: [(назва, початок, кінець)].
+
+    Потрібно розумному читанню (reader.py), щоб зрозуміти, до ЯКОГО
+    пункту списку належить тип: «Шахеди: ... FPV-дрони: ...» — усе, що
+    після другого заголовка, це вже FPV, а не шахеди.
+    """
+    out = []
+    for name, _emoji, rx in _COMPILED:
+        for m in rx.finditer(low):
+            out.append((name, m.start(), m.end()))
+    out.sort(key=lambda t: t[1])
+    return out
+
+
+# Маркери теж шукаємо ПО МЕЖІ СЛОВА. Без цього «Чистоводовка»
+# читалась як «чисто» (тобто відбій) і глушила справжню ціль.
+#
+# Більшість маркерів — це КОРЕНІ, у яких змінюється закінчення
+# («пошкоджен-о/-ий», «прилет-ів/-іла»), тому справа межу не ставимо.
+# А ось ці — цілі слова, і саме вони й давали хибні збіги:
+#   «чисто»  у «Чистоводовка»   → фальшивий відбій
+#   «над»    у «Надія», «надійшло»
+#   «мимо»   у «мимохідь»
+_WHOLE_WORDS = {"чисто", "свої", "свои", "над", "повз", "мимо"}
+
+
+def _bounded(words):
+    return re.compile("|".join(
+        r"(?<!\w)" + re.escape(w) + (r"(?!\w)" if w in _WHOLE_WORDS else "")
+        for w in words))
+
+
+_COURSE_RE = _bounded(COURSE_MARKERS)
+_CALM_RE = _bounded(CALM_MARKERS)
+_IMPACT_RE = _bounded(IMPACT_MARKERS)
+
+
 def has_course(low: str) -> bool:
     """Есть ли признак движения угрозы в сторону цели."""
-    return any(m in low for m in COURSE_MARKERS)
+    return bool(_COURSE_RE.search(low))
 
 
 def is_calm(low: str) -> bool:
     """Сообщение про отбой / отсутствие угрозы."""
-    return any(m in low for m in CALM_MARKERS)
+    return bool(_CALM_RE.search(low))
 
 
 def is_impact(low: str) -> bool:
     """Сообщение про уже случившийся прилёт."""
-    return any(m in low for m in IMPACT_MARKERS)
+    return bool(_IMPACT_RE.search(low))

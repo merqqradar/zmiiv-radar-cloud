@@ -38,7 +38,7 @@ IS_CLOUD = os.getenv("RADAR_IS_CLOUD", "").strip() == "1"
 # Єдиний номер версії радара. Показується у вікні застосунку, поруч
 # з назвою «Радар Зміїв». Піднімати на одиницю при кожному помітному
 # оновленні — і в застосунку, і в назві файлу архіву при збірці.
-VERSION = "3.9"
+VERSION = "4.0"
 
 # Читаем .env (файл создаёт и заполняет владелец проекта вручную)
 load_dotenv(BASE_DIR / ".env")
@@ -108,6 +108,11 @@ REVIEW_LIMIT = _S["review_limit"]
 SMART_EXPLAIN = _S["smart_explain"]
 SMART_BEFORE_SERIES = _S["smart_before_series"]
 DUP_NOTICE_ENABLED = _S["dup_notice_enabled"]
+# Глибокий розбір повідомлення (reader.py) і зняття за зведеннями
+SMART_READ = _S["smart_read"]
+REPORT_CLEAR = _S["report_clear"]
+REPORT_CLEAR_VOTES = _S["report_clear_votes"]
+REPEAT_WINDOW_MIN = _S["repeat_window_min"]
 ROLE = _S["role"]
 OWNER_ID = _S["owner_id"]
 
@@ -168,6 +173,7 @@ def reload_settings() -> dict:
     global FILTER_PLANNED, FILTER_CONFIDENCE, FILTER_VOTES, FILTER_CONTEXT
     global SMART_REVIEW, REVIEW_MINUTES, REVIEW_LIMIT
     global SMART_EXPLAIN, SMART_BEFORE_SERIES, DUP_NOTICE_ENABLED
+    global SMART_READ, REPORT_CLEAR, REPORT_CLEAR_VOTES, REPEAT_WINDOW_MIN
     global ROLE, OWNER_ID, TELEGRAM_CONTROL, TARGET_CHAT_ID, BOT_TOKEN
     global CITY_2_ON, CITY_3_ON
     global CITY_MAIN_NAME, CITY_MAIN_VARIANTS, CITY_2_NAME, CITY_2_VARIANTS
@@ -212,6 +218,10 @@ def reload_settings() -> dict:
     SMART_EXPLAIN = s["smart_explain"]
     SMART_BEFORE_SERIES = s["smart_before_series"]
     DUP_NOTICE_ENABLED = s["dup_notice_enabled"]
+    SMART_READ = s["smart_read"]
+    REPORT_CLEAR = s["report_clear"]
+    REPORT_CLEAR_VOTES = s["report_clear_votes"]
+    REPEAT_WINDOW_MIN = s["repeat_window_min"]
     ROLE = s["role"]
     OWNER_ID = s["owner_id"]
     TARGET_CHAT_ID = (s.get("target_chat_id") or "").strip() or \

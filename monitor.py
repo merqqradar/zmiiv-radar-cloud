@@ -685,7 +685,7 @@ class Radar:
         """
         data = {"when": datetime.now(), "channels": 0, "messages": 0,
                 "threats": 0, "oblast": 0, "near": 0, "by_type": {},
-                "threat_items": [],
+                "threat_items": [], "failed": [],
                 "top": None, "top_when": None, "top_link": None,
                 "top_gone": False,
                 "oblast_link": None, "oblast_when": None,
@@ -733,6 +733,9 @@ class Radar:
         # Ракети в області: (час, кількість, тип, канал, id) з усіх
         # каналів — групуємо по часу нижче, після циклу.
         oblast_hits = []
+        # Зведення по області: (час, канал, id, перелік цілей) — повний
+        # зріз обстановки, з якого рахуємо «Цілей в області».
+        report_hits = []
 
         for channel in config.CHANNELS:
             ok_channel = False
@@ -824,9 +827,7 @@ class Radar:
                                     })
                             elif res.get("near_home"):
                                 data["near"] += 1
-                            for name, _e in res["threats"]:
-                                data["by_type"][name] = \
-                                    data["by_type"].get(name, 0) + 1
+
 
                         # Найсвіжіша і найважливіша загроза — для посилання
                         better = (data["top_when"] is None
@@ -843,10 +844,25 @@ class Radar:
                         count, kind = hit
                         oblast_hits.append((msg.date, count, kind, channel,
                                            msg.id))
+
+                    # Зведення по області — рахуємо ВСІ типи цілей, а не
+                    # лише ракети: шахеди й БпЛА теж «цілі в області».
+                    if (config.SMART_READ
+                            and msg.date >= fresh_cutoff
+                            and reader.area_report(msg.text)):
+                        targets = reader.area_targets(msg.text)
+                        if targets:
+                            report_hits.append((msg.date, channel, msg.id,
+                                               targets))
             except Exception:                               # noqa: BLE001
-                continue
+                pass
             if ok_channel:
                 data["channels"] += 1
+            else:
+                # Канал мовчить або закрив публічний перегляд. Це треба
+                # показувати, а не ховати: інакше здається, що загроз
+                # немає, хоча насправді радар просто не читає джерело.
+                data["failed"].append(channel)
 
         # Явне підтвердження зняття рахуємо, лише якщо його власний
         # контекст сам згадує місто (city_gone_evidence) — інакше це
@@ -890,8 +906,38 @@ class Radar:
         data["oblast_link"] = best_link
         data["oblast_when"] = best_when
 
-        log.info("огляд: канали %d, повідомлень %d, загроз %d",
-                 data["channels"], data["messages"], data["threats"])
+        # ОБСТАНОВКА ПО ОБЛАСТІ ЗА ЗВЕДЕННЯМИ.
+        # Підрахунок вище (oblast_rockets) бачить лише РАКЕТИ, та ще й
+        # від трьох штук — тому в закріпленому чесно писалось «Цілей в
+        # області: 0» тоді, коли по області йшли шахеди.
+        # Зведення каналу — це повний зріз на конкретну хвилину, тому
+        # беремо найсвіжіше (а серед однаково свіжих — найповніше), а не
+        # суму по каналах: інакше один шахед, про який написали три
+        # канали, перетворився б на три цілі.
+        if report_hits:
+            report_hits.sort(key=lambda h: (h[0], sum(
+                t["count"] for t in h[3])))
+            newest = report_hits[-1][0]
+            same_time = [h for h in report_hits
+                         if newest - h[0] <= timedelta(minutes=3)]
+            best = max(same_time,
+                       key=lambda h: sum(t["count"] for t in h[3]))
+            when, channel, msg_id, targets = best
+            by_kind = {}
+            for target in targets:
+                by_kind[target["kind"]] = (by_kind.get(target["kind"], 0)
+                                           + target["count"])
+            data["oblast"] = sum(by_kind.values())
+            data["by_type"] = by_kind
+            data["oblast_link"] = f"https://t.me/{channel}/{msg_id}"
+            data["oblast_when"] = when
+            log.info("обстановка по області за зведенням %s: %d цілей (%s)",
+                     channel, data["oblast"],
+                     ", ".join(f"{v}×{k}" for k, v in by_kind.items()))
+
+        log.info("огляд: канали %d, повідомлень %d, загроз %d, "
+                 "цілей в області %d", data["channels"], data["messages"],
+                 data["threats"], data["oblast"])
         return data
 
     async def _standby_tick(self) -> None:

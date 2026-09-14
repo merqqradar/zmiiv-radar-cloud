@@ -84,6 +84,33 @@ def _brief_types(table: dict | None) -> str:
     return " (" + ", ".join(parts[:3]) + ")"
 
 
+def _journal_lines(caption: str, journal: list | None, with_place: bool,
+                   limit: int = 3) -> list:
+    """Рядок закріпленого з останніми подіями та посиланнями на джерела.
+
+    «прильотів 2» саме по собі перевірити ніяк: незрозуміло ні де, ні
+    за яким повідомленням радар так вирішив. Тому поряд — час, місце
+    і клікабельне джерело.
+    """
+    journal = journal or []
+    if not journal:
+        return []
+    parts, note = [], ""
+    for item in journal[-limit:]:
+        what = item.get("place") if with_place else item.get("kind", "").lower()
+        label = f"{item.get('t', '')} {what or '—'}"
+        if item.get("link"):
+            parts.append(f"<a href=\"{item['link']}\">{label}</a>")
+        else:
+            parts.append(label)
+        if item.get("note"):
+            note = (f"\n     ⚠️ <i>{item['note']}</i>"
+                    + (f" · <a href=\"{item['note_link']}\">джерело</a>"
+                       if item.get("note_link") else ""))
+    tail = f" <i>(+{len(journal) - limit})</i>" if len(journal) > limit else ""
+    return [f"{caption} " + " · ".join(parts) + tail + note]
+
+
 def _brief_places(journal: list | None) -> str:
     """«(Слобожанське, Андріївка)» — де саме були прильоти."""
     journal = journal or []
@@ -104,7 +131,9 @@ def format_review(data: dict, city: str, html: bool = True) -> str:
         f"🔎 {b(data['when'].strftime('%H:%M'))} · смарт-перевірка "
         f"за {config.REVIEW_MINUTES} хв",
         f"Основне місто: {city}",
-        f"Перевірено каналів: {data['channels']}",
+        f"Перевірено каналів: {data['channels']}"
+        + (f" · <b>не читаються: {', '.join(data['failed'])}</b>"
+           if data.get("failed") else ""),
         f"Прочитано повідомлень: {data['messages']}",
         f"Виявлено загроз місту: {data['threats']}"
         + _brief_types({k: v for k, v in _count_kinds(
@@ -205,9 +234,15 @@ def build_text(stats: dict, started: datetime, last_alert, paused: bool,
         + (f" · {REASON_LABEL.get(reason, reason)}" if reason else ""),
         f"<b>За добу:</b> загроз {daily.get('threats', 0)}"
         f"{_brief_types(daily.get('by_type'))} · "
-        f"прильотів {daily.get('impacts', 0)}"
-        f"{_brief_places(daily.get('impact_log'))} · "
-        f"переглянуто {daily.get('seen', 0)}",
+        f"прильотів {daily.get('impacts', 0)} · "
+        f"переглянуто {daily.get('seen', 0)}",]
+
+    # Самі події з посиланнями — щоб число можна було перевірити, не
+    # відкриваючи звіт: видно час, місце і першоджерело кожної події.
+    lines += _journal_lines("🔴 Загрози:", daily.get("threat_log"), False)
+    lines += _journal_lines("💥 Прильоти:", daily.get("impact_log"), True)
+
+    lines += [
         "",
         "<i>Збирає повідомлення кількох Telegram-каналів моніторингу, "
         "відбирає ті, що стосуються Змієва, і пересилає сюди.</i>",

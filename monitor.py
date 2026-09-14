@@ -1829,7 +1829,12 @@ class Radar:
                     self.moved_away = False
                     self.report_votes = []
                 save_active_threat(self.active_threat)
-            elif res["level"] == "MEDIUM" and res.get("near_home"):
+            elif res["level"] == "MEDIUM":
+                # Будь-яка ціль поруч, а не лише в ближньому колі:
+                # Печеніги, Мартове й решта дальнього поясу мають
+                # near_home=False, і через це вони не потрапляли в
+                # журнал зовсім — у звіті стояв нуль, хоча сповіщення
+                # про них у чат ішли.
                 self._bump("near")
                 self._log_event(
                     "near_log",

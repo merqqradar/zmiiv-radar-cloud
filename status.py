@@ -131,14 +131,14 @@ def format_review(data: dict, city: str, html: bool = True) -> str:
         f"🔎 {b(data['when'].strftime('%H:%M'))} · смарт-перевірка "
         f"за {config.REVIEW_MINUTES} хв",
         f"Основне місто: {city}",
-        f"Перевірено каналів: {data['channels']}"
-        + (f" · <b>не читаються: {', '.join(data['failed'])}</b>"
-           if data.get("failed") else ""),
+        f"Перевірено каналів: {data['channels']}",
         f"Прочитано повідомлень: {data['messages']}",
         f"Виявлено загроз місту: {data['threats']}"
         + _brief_types({k: v for k, v in _count_kinds(
             data.get("threat_items")).items()}),
         f"Цілей в області: {_types_line(data)}"
+        + (f" · станом на {data['oblast_when'].astimezone():%H:%M}"
+           if data.get("oblast_when") else "")
         + (f" · <a href=\"{data['oblast_link']}\">джерело</a>"
            if html and data.get("oblast_link") else ""),
         f"Поруч (сусідні НП): {data['near']}",

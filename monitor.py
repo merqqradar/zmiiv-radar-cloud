@@ -1055,7 +1055,8 @@ class Radar:
         self.daily[field] = self.daily.get(field, 0) + 1
         save_daily(self.daily)
 
-    def _log_event(self, field: str, kind: str, place: str, src) -> None:
+    def _log_event(self, field: str, kind: str, place: str, src,
+                   note: str = "") -> None:
         """Записує подію в журнал доби: коли, що, де і ЗВІДКИ.
 
         Без цього звіт казав лише «прильотів 2» — а де саме і за яким
@@ -1070,18 +1071,20 @@ class Radar:
                  "place": place or "—",
                  "ch": src[0] if src else "",
                  "link": src[1] if src else "",
-                 "note": "", "note_link": "", "note_ch": ""}
+                 "note": f"можливо, це не приліт: {note}" if note else "",
+                 "note_link": src[1] if (note and src) else "",
+                 "note_ch": src[0] if (note and src) else ""}
         journal = self.daily.setdefault(field, [])
         journal.append(entry)
         del journal[:-EVENT_LOG_LIMIT]
         save_daily(self.daily)
 
-    def _explain_impacts(self, text: str, src) -> None:
-        """Пізніше з'ясувалось, що вибух був плановим розмінуванням.
+    def _explain_impacts(self, why: str, src, places=None) -> None:
+        """Канали пояснили, чим насправді був вибух.
 
-        Канали спершу пишуть «вибух», радар чесно рахує це прильотом, і
-        лише через півгодини з'являється «це були планові підривні
-        роботи, щось пішло не за планом». Саме такий випадок і був.
+        Спершу приходить «вибух», радар чесно рахує це прильотом, і лише
+        згодом з'являється пояснення: розмінування, збиття цілі над
+        селом, звук прольоту, газ на підстанції, «не підтвердилось».
         Заднім числом позначаємо вже записані прильоти — обережно
         («можливо») і з посиланням, щоб можна було звірити самому.
         """
@@ -1097,15 +1100,19 @@ class Radar:
                 continue
             if now - when > timedelta(hours=EXPLAIN_IMPACT_HOURS):
                 continue
-            entry["note"] = ("можливо, це були планові підривні роботи "
-                             "(розмінування), а не приліт")
+            # Якщо в поясненні назване конкретне село — позначаємо лише
+            # вибух ТАМ. Інакше повідомлення «над Слобожанським працює
+            # ППО» позначило б заодно й вибух в Андріївці за 20 км.
+            if places and entry.get("place") not in places:
+                continue
+            entry["note"] = f"можливо, це не приліт: {why}"
             entry["note_link"] = src[1] if src else ""
             entry["note_ch"] = src[0] if src else ""
             marked += 1
         if marked:
             save_daily(self.daily)
-            log.info("уточнення заднім числом: %d приліт(и) позначено як "
-                     "можливі планові підривні роботи", marked)
+            log.info("уточнення заднім числом: %d приліт(и) — %s",
+                     marked, why)
 
     def _bump_type(self, field: str, name: str) -> None:
         """Считает угрозы и прилёты по типам — для отчёта."""
@@ -1167,26 +1174,58 @@ class Radar:
             return lines
 
         lines = [title, ""]
-        lines += block("🔴 Загроз Змієву:", data.get("threats", 0),
-                       data.get("by_type") or {},
+
+        # --- Що прямо зараз ---------------------------------------------------
+        # Звіт читають, щоб зрозуміти обстановку, а не лише підсумки.
+        if day == "today":
+            lines.append("<b>ЗАРАЗ</b>")
+            if self.active_threat:
+                lines.append(
+                    f"🔴 Загроза місту: {escape(self.active_threat['place'])}"
+                    f" · з {self.active_threat['since']:%H:%M}")
+            else:
+                lines.append(f"🟢 Загроз місту {geo.main_name()} немає")
+            if self.near_threat:
+                lines.append(f"🟠 Ціль поруч: "
+                             f"{escape(self.near_threat['place'])}"
+                             f" · з {self.near_threat['since']:%H:%M}")
+            if self.alarm:
+                lines.append(f"🟡 {self.alarm[0]} по району "
+                             f"з {self.alarm[1]:%H:%M}")
+            else:
+                lines.append("🟢 Тривоги по району немає")
+            if self.oblast:
+                note, link, when = self.oblast
+                lines.append(f"🛩 По області: {escape(note)} "
+                             f"· <a href=\"{link}\">джерело</a> ({when:%H:%M})")
+            lines.append("")
+
+        # --- Підсумки за добу -------------------------------------------------
+        lines.append("<b>ЗА ДОБУ</b>")
+        lines += block(f"🔴 Загроз місту {geo.main_name()}:",
+                       data.get("threats", 0), data.get("by_type") or {},
                        data.get("threat_log"))
         lines.append("")
-        lines += block("💥 Прильотів поруч:", data.get("impacts", 0),
+        lines += block("💥 Вибухів і прильотів поруч:", data.get("impacts", 0),
                        data.get("impact_types") or {},
                        data.get("impact_log"), with_place=True)
+        lines.append("")
+        lines += block("🟠 Цілей поруч (сусідні села):", data.get("near", 0),
+                       {}, data.get("near_log"), with_place=True)
         lines += ["", f"🟡 Тривог по району: <b>{data.get('alarms', 0)}</b>"]
 
         civil = data.get("civil") or {}
         if civil:
-            lines.append("🟣 Інше:")
+            lines.append("🟣 Інше (світло, вода, газ):")
             for name, count in sorted(civil.items(), key=lambda kv: -kv[1]):
                 lines.append(f"     └ {name.lower()}: {count}")
 
         lines += ["", f"Переглянуто повідомлень: {data.get('seen', 0)}"]
-        if day == "today" and self.alarm:
-            lines.append(f"\n🟡 Зараз триває {self.alarm[0].lower()} "
-                         f"з {self.alarm[1]:%H:%M}")
-        lines.append("\n<i>Інформація орієнтовна: зібрана з Telegram-каналів "
+        lines.append("\n<i>Час, місце і посилання під кожним числом — щоб "
+                     "можна було відкрити першоджерело й перевірити самому. "
+                     "Позначка «можливо, це не приліт» означає, що канали "
+                     "пізніше пояснили вибух інакше.</i>")
+        lines.append("<i>Інформація орієнтовна: зібрана з Telegram-каналів "
                      "моніторингу й може містити неточності.</i>")
         text = "\n".join(lines)
         # Telegram не приймає повідомлення довші за 4096 символів — у
@@ -1268,14 +1307,26 @@ class Radar:
                 if alarm_changed and self._status_dirty:
                     self._status_dirty.set()
 
-        # Канали пізніше пояснили вибух: це були планові підривні роботи.
-        # Перевіряємо ДО класифікації, бо саме таке повідомлення саме по
-        # собі сповіщення не дає (це INFO, який може бути вимкнений), а
-        # вже записаний «приліт» лишався б у звіті без пояснення.
-        if classify.planned_works(text) and (
-                geo.find_zmiiv(text.lower()) or geo.find_close(text.lower())
-                or geo.find_home_district(text.lower())):
-            self._explain_impacts(text, src)
+        # Канали пізніше пояснили вибух: розмінування, робота ППО, звук
+        # прольоту, побутовий вибух, «не підтвердилось»… Перевіряємо ДО
+        # класифікації, бо таке повідомлення саме по собі сповіщення не
+        # дає (це INFO, який може бути вимкнений), а вже записаний
+        # «приліт» лишався б у звіті без жодного пояснення.
+        low_text = text.lower()
+        if geo.find_zmiiv(low_text) or geo.find_close(low_text) \
+                or geo.find_home_district(low_text):
+            why = classify.explain_boom(text)
+            if why:
+                # Села, названі в самому поясненні: якщо вони є, позначку
+                # ставимо лише тим вибухам, що сталися саме там.
+                named = geo.find_close(low_text) + geo.find_near(low_text)
+                # «У Зміївському РАЙОНІ розмінування» — це про весь
+                # район, а не про саме місто: позначаємо всі вибухи.
+                # А «у Змієві вибух на підстанції» — тільки міські.
+                wide = "район" in low_text or "громад" in low_text
+                if geo.find_zmiiv(low_text) and not wide:
+                    named.append(geo.main_name())
+                self._explain_impacts(why, src, named or None)
 
         # Свет, вода, газ, химия, ДРГ, радиация — без звука.
         # Исключение: радиационная угроза, она со звуком.
@@ -1718,10 +1769,14 @@ class Radar:
                 self._bump("impacts")
                 for name, _emoji in res["threats"]:
                     self._bump_type("impact_types", name)
+                # Якщо сам допис уже пояснює вибух («вибух на газовій
+                # підстанції»), позначку ставимо одразу: такий вибух не
+                # має виглядати у звіті як приліт від удару.
                 self._log_event(
                     "impact_log",
                     res["threats"][0][0] if res["threats"] else "вибух",
-                    (res["places"] or ["район"])[0], src)
+                    (res["places"] or ["район"])[0], src,
+                    note=classify.explain_boom(res["text"]) or "")
 
             # Стан (активна ціль, заголовок закріпленого) виставляємо
             # ДО «особливої небезпеки» нижче: _raise_critical шле пачку
@@ -1756,7 +1811,13 @@ class Radar:
                     self.moved_away = False
                     self.report_votes = []
                 save_active_threat(self.active_threat)
-            elif res["level"] == "MEDIUM":
+            elif res["level"] == "MEDIUM" and res.get("near_home"):
+                self._bump("near")
+                self._log_event(
+                    "near_log",
+                    res["threats"][0][0] if res["threats"] else "ціль",
+                    (res["places"] or ["поруч"])[0], src)
+            if res["level"] == "MEDIUM" and not res.get("main_city"):
                 # «Поруч» (сусіднє село чи ціль курсом на віддалене село
                 # з дальнього поясу — near_home тут не обов'язково True)
                 # досі не мав власного закриття: на відміну від

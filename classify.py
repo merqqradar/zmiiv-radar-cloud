@@ -576,22 +576,85 @@ def _zmiiv_segment(low: str) -> str | None:
     return None
 
 
-def mass_reason(low: str, threat_names: list) -> str | None:
-    """Чи є загроза масовою/важкою. Повертає коротке пояснення або None."""
+def _place_segments(low: str, places: list) -> list:
+    """Усі частини повідомлення, де названо САМЕ ці НП (а не будь-яке інше).
+
+    Канали часто дають зведення по всій області одним повідомленням і
+    лише потім розбивають по пунктах:
+        «Наразі в області 3 реактивних БПЛА типу Шахед:
+         ▪️1 на Питомник ▪️1 на Васищеве ▪️1 на Чугуїв»
+    Без цієї функції «3» з заголовка зведення бралося як кількість
+    цілей САМЕ на Васищеве — і на 1 реальний шахед радар піднімав
+    червону тривогу «3 ШТ», ще й з повторами.
+
+    Повертаємо ВСІ збіжні частини, а не першу-ліпшу: якщо саме наше
+    село згадане в кількох пунктах поспіль без цифр («на Васищеве»,
+    «на Васищеве» — так теж пишуть), кожен пункт — це окрема ціль.
+    """
+    out = []
+    for part in SEGMENT_RE.split(low):
+        found_here = (geo.find_close(part) + geo.find_near(part)
+                     + geo.find_far(part) + geo.find_extra(part))
+        if geo.find_zmiiv(part):
+            found_here.append(geo.main_name())
+        if any(p in found_here for p in places):
+            out.append(part)
+    return out
+
+
+def _segment_count(seg: str, wide: bool) -> int:
+    """Скільки цілей у пункті: явна цифра або 1, якщо пункт про нашу ціль.
+
+    «1 на Васищеве» — явно 1. «на Васищеве» (без цифри) — теж 1, просто
+    канал не продублював очевидне. wide=True — дозволяє шукати цифру не
+    лише біля назви типу (COUNT_RE), а й біля «на/курсом» (COUNT_TO_RE),
+    це безпечно лише всередині вже звуженого до нашого НП сегмента.
+    """
+    best = 0
+    for match in COUNT_RE.finditer(seg):
+        best = max(best, int(match.group(1)))
+    if not best and wide:
+        for match in COUNT_TO_RE.finditer(seg):
+            best = max(best, int(match.group(1)))
+    return best or 1
+
+
+def mass_reason(low: str, threat_names: list, places: list | None = None) -> str | None:
+    """Чи є загроза масовою/важкою. Повертає коротке пояснення або None.
+
+    places — конкретні НП, через які радар вирішив надіслати
+    сповіщення (не весь список «НП» у повідомленні, а саме ті, що
+    визначили рівень і причину). Якщо задано, число цілей рахуємо лише
+    в частинах повідомлення, де названо ці НП, і підсумовуємо їх —
+    інакше зведення по всій області («в області 3 шахеди») помилково
+    стає «3 шахеди на наше село», хоча на нього йде лише один. І
+    навпаки: «на Васищеве … на Васищеве … на Васищеве» без жодної
+    цифри — це справді три цілі, а не жодної.
+    """
     # Ціль уже пройшла — не привід будити повторами
     if any(word in low for word in PASSED):
         return None
 
-    # Якщо Зміїв названий — рахуємо тільки те, що стосується його частини
-    scope = _zmiiv_segment(low) if geo.find_zmiiv(low) else low
-
-    for match in COUNT_RE.finditer(scope):
-        if int(match.group(1)) >= 3:
-            return f"{match.group(1)} цілей"
-    if scope is not low:                 # тільки в частині про Зміїв
-        for match in COUNT_TO_RE.finditer(scope):
+    if places:
+        segments = _place_segments(low, places)
+        if segments:
+            total = sum(_segment_count(seg, wide=True) for seg in segments)
+            if total >= 3:
+                return f"{total} цілей"
+            scope = " ".join(segments)
+        else:
+            scope = low
+    else:
+        # Якщо Зміїв названий — рахуємо тільки те, що стосується його частини
+        scope = _zmiiv_segment(low) if geo.find_zmiiv(low) else low
+        for match in COUNT_RE.finditer(scope):
             if int(match.group(1)) >= 3:
                 return f"{match.group(1)} цілей"
+        if scope is not low:             # тільки в частині про Зміїв
+            for match in COUNT_TO_RE.finditer(scope):
+                if int(match.group(1)) >= 3:
+                    return f"{match.group(1)} цілей"
+
     for word in MASS_WORDS:
         if word in scope:
             return "масована загроза"
@@ -1027,6 +1090,11 @@ def classify(text: str) -> dict | None:
     digest = is_digest(body)
 
     places = ([geo.main_name()] if zmiiv else []) + close + far + extra + near
+    # Для підрахунку «масовості» far (Чугуїв і т.п.) не годиться: це
+    # лише контекст, не наша ціль. Якщо взяти й Чугуїв, кількість
+    # цілей САМЕ на нього могла б помилково піднімати тривогу по
+    # Васищевому чи Зміїву.
+    mass_places = ([geo.main_name()] if zmiiv else []) + close + near + extra
 
     # --- Свої звуки / робота ППО -------------------------------------------
     if friendly and not (course and air):
@@ -1117,7 +1185,7 @@ def classify(text: str) -> dict | None:
     else:
         confidence = "low"
 
-    mass = (mass_reason(low, threat_names)
+    mass = (mass_reason(low, threat_names, mass_places)
             if level in ("HIGH", "MEDIUM") and not digest
             and confidence != "low" and not threat_gone(text) else None)
 

@@ -68,6 +68,17 @@ DIGEST_MARKERS = [
 ]
 
 
+def has_digest_marker(body: str) -> bool:
+    """Є явний маркер добової зведення («протягом минулої доби», «зведення»).
+
+    Строгіше за is_digest(): там достатньо бути довгим (400+ символів),
+    а довгим буває й свіжий репортаж про удар по сусідньому селищі —
+    його губити не можна.
+    """
+    low = body.lower()
+    return any(m in low for m in DIGEST_MARKERS)
+
+
 def is_digest(body: str) -> bool:
     """Ретроспективная сводка, а не оперативное предупреждение."""
     low = body.lower()
@@ -99,6 +110,19 @@ def clean(text: str) -> str:
     """Убирает ссылки и рекламные хвосты, оставляет суть."""
     t = PROMO_RE.sub(" ", text)
     t = SPACES_RE.sub(" ", t)
+    return t.strip(" \n\t·|—-")
+
+
+def clean_lines(text: str) -> str:
+    """Як clean(), але переноси рядків ЗБЕРІГАЮТЬСЯ.
+
+    Канали пишуть списком, по одному пункту в рядок. clean() зліплює все
+    в один рядок, і розбір на пункти втрачає межі: заголовок «Наразі в
+    області 3 шахеди» прилипав до першого пункту. Тут рядки живі.
+    """
+    t = PROMO_RE.sub(" ", text)
+    t = re.sub(r"[^\S\n]+", " ", t)
+    t = re.sub(r"\s*\n\s*", "\n", t)
     return t.strip(" \n\t·|—-")
 
 
@@ -431,6 +455,14 @@ THREAT_GONE = [
     ("отбой угрозы", "відбій загрози"),
     ("не фіксу", "не фіксується"),
     ("не фиксиру", "не фіксується"),
+    # «Без фиксации», «Не відстежується» — так канали пишуть зняття
+    # одним-двома словами (radar_kharkov, monitor1654).
+    ("без фіксац", "без фіксації"),
+    ("без фиксац", "без фіксації"),
+    ("не відстежу", "не відстежується"),
+    ("не отслежи", "не відстежується"),
+    ("не зафіксов", "не зафіксовано"),
+    ("не зафиксир", "не зафіксовано"),
     ("не спостеріга", "не спостерігається"),
     ("не наблюда", "не спостерігається"),
     ("зникла з радар", "зникла з радарів"),
@@ -468,6 +500,73 @@ def moved_away(text: str):
                       r"пошла на|змістилася на|сместилась на|сместился на)"
                       r"\s+([А-ЯЄІЇA-Z][\w’'\-]+)", body)
     return match.group(1) if match else "інший напрямок"
+
+
+# --- Ціль ПОКИНУЛА область ---------------------------------------------------
+# «Бандероли покидают нашу область в соседние области, по баллистике угроза
+# сохраняется, для нашей без фиксации» — це зняття загрози, але вибіркове:
+# по бандеролях можна заспокоїтись, по балістиці — ні. Тому окремо від
+# threat_gone: там «не фіксується» знімає будь-яку ціль, а тут кожен тип
+# читається за своєю частиною речення.
+LEAVING_MARKERS = [
+    "покидают", "покинули", "покидає", "покидають", "залишають", "залишили",
+    "вийшли з", "вышли из", "виходять з", "выходят из", "вилетіли з",
+    "вылетели из", "полетіли в сусід", "полетели в сосед", "пішли в сусід",
+    "ушли в сосед", "йдуть в сусід", "идут в сосед", "уходят в сосед",
+    "перелетіли в", "перелетели в", "вийшли за межі", "вышли за пределы",
+]
+STAY_MARKERS = ["зберіг", "сохраня", "залишається", "остаётся", "остается",
+                "триває", "продолжается", "актуальн"]
+_CLAUSE_SPLIT = re.compile(r"[.;,!\n]|\s[—–-]\s")
+
+
+def threat_left(text: str):
+    """Повідомлення «ціль (певного типу) покинула область».
+
+    Повертає {"left": [типи], "generic": bool, "stay": [типи]} або None.
+    generic=True — тип не названо («цілі покидають область»): тоді
+    знімається все, крім того, про що прямо сказано «загроза зберігається».
+    Якщо в повідомленні названо наше місто чи село — це не «ціль пішла
+    геть», а звичайне повідомлення про підліт, тут воно не потрібне.
+    """
+    body = clean(text)
+    if not body:
+        return None
+    low = body.lower()
+    if not any(m in low for m in LEAVING_MARKERS):
+        return None
+    if "област" not in low and "обл." not in low:
+        return None
+    if geo.find_zmiiv(low) or geo.find_close(low):
+        return None
+
+    left, stay, generic = set(), set(), False
+    for clause in _CLAUSE_SPLIT.split(low):
+        kinds = [n for n, _e in threats.detect_threats(clause)]
+        if any(m in clause for m in LEAVING_MARKERS):
+            if kinds:
+                left.update(kinds)
+            else:
+                generic = True
+        if any(m in clause for m in STAY_MARKERS):
+            stay.update(kinds)
+    if not left and not generic:
+        return None
+    return {"left": sorted(left), "generic": generic, "stay": sorted(stay)}
+
+
+def left_matches(left: dict, kind: str) -> bool:
+    """Чи стосується «покинули область» цілі даного типу."""
+    if not left or not kind:
+        return bool(left and left.get("generic") and not left.get("stay"))
+    if kind in left["stay"]:
+        return False
+    if kind in left["left"]:
+        return True
+    # «Ракета» у заголовку списку часто означає ту саму бандероль
+    if kind == "Ракета" and "Бандероль" in left["left"]:
+        return True
+    return bool(left.get("generic"))
 
 
 def threat_gone(text: str, context: str = "", expected_kind: str = ""):
@@ -602,34 +701,40 @@ def _place_segments(low: str, places: list) -> list:
     return out
 
 
-def _segment_count(seg: str, wide: bool) -> int:
-    """Скільки цілей у пункті: явна цифра або 1, якщо пункт про нашу ціль.
+def _explicit_count(seg: str) -> int:
+    """Явна цифра в пункті («2 на Змиев», «3х шахеди») або 0, якщо цифри нема.
 
-    «1 на Васищеве» — явно 1. «на Васищеве» (без цифри) — теж 1, просто
-    канал не продублював очевидне. wide=True — дозволяє шукати цифру не
-    лише біля назви типу (COUNT_RE), а й біля «на/курсом» (COUNT_TO_RE),
-    це безпечно лише всередині вже звуженого до нашого НП сегмента.
+    Без цифри пункт — це «одна чи кілька, невідомо», а НЕ «одна» й
+    тим більше не «кілька». Вирішальне правило: кількість, якої канал не
+    назвав, радар не вигадує.
     """
     best = 0
     for match in COUNT_RE.finditer(seg):
         best = max(best, int(match.group(1)))
-    if not best and wide:
+    if not best:
         for match in COUNT_TO_RE.finditer(seg):
             best = max(best, int(match.group(1)))
-    return best or 1
+    return best
 
 
-def mass_reason(low: str, threat_names: list, places: list | None = None) -> str | None:
+def mass_reason(low: str, threat_names: list, places: list | None = None,
+                typed_here: bool = False) -> str | None:
     """Чи є загроза масовою/важкою. Повертає коротке пояснення або None.
 
-    places — конкретні НП, через які радар вирішив надіслати
-    сповіщення (не весь список «НП» у повідомленні, а саме ті, що
-    визначили рівень і причину). Якщо задано, число цілей рахуємо лише
-    в частинах повідомлення, де названо ці НП, і підсумовуємо їх —
-    інакше зведення по всій області («в області 3 шахеди») помилково
-    стає «3 шахеди на наше село», хоча на нього йде лише один. І
-    навпаки: «на Васищеве … на Васищеве … на Васищеве» без жодної
-    цифри — це справді три цілі, а не жодної.
+    places — конкретні НП, через які радар вирішив надіслати сповіщення.
+    Якщо задано, число цілей беремо лише з тих пунктів повідомлення, де
+    названо САМЕ ці НП: зведення по всій області («в області 3 шахеди»)
+    не має ставати «3 шахеди на наше село».
+
+    Береться НАЙБІЛЬШЕ явне число з таких пунктів, а не сума. Раніше
+    підсумовували й пункти без цифр («на Мерефу» + «на Змиев» + «2 на
+    Чкаловське» = «4 шахеди на Зміїв») — і на один шахед на Зміїв радар
+    піднімав червону тривогу з повторами. Сума різних напрямків — не
+    кількість цілей на конкретне місце.
+
+    typed_here — назви типів у threat_names уже відібрані по пунктах
+    самого списку (з успадкуванням заголовка), тож перевіряти, що корінь
+    стоїть у тому ж рядку, не треба.
     """
     # Ціль уже пройшла — не привід будити повторами
     if any(word in low for word in PASSED):
@@ -638,9 +743,9 @@ def mass_reason(low: str, threat_names: list, places: list | None = None) -> str
     if places:
         segments = _place_segments(low, places)
         if segments:
-            total = sum(_segment_count(seg, wide=True) for seg in segments)
-            if total >= 3:
-                return f"{total} цілей"
+            best = max(_explicit_count(seg) for seg in segments)
+            if best >= 3:
+                return f"{best} цілей"
             scope = " ".join(segments)
         else:
             scope = low
@@ -661,8 +766,8 @@ def mass_reason(low: str, threat_names: list, places: list | None = None) -> str
 
     # Важкий тип має бути названий поруч зі Зміївом, а не деінде
     heavy_here = [t for t in threat_names
-                  if t in HEAVY and any(root in scope
-                                        for root in _HEAVY_ROOTS.get(t, []))]
+                  if t in HEAVY and (typed_here or any(
+                      root in scope for root in _HEAVY_ROOTS.get(t, [])))]
     if heavy_here:
         return heavy_here[0].lower()
     return None
@@ -1057,9 +1162,13 @@ def classify(text: str) -> dict | None:
     # Застосовуємо лише до СПИСКІВ (два й більше пункти): звичайне
     # повідомлення з одного речення читається як і раніше.
     deep = None
+    list_mode = False
     if config.SMART_READ:
-        deep = reader.read(body)
+        # Читаємо текст із живими рядками: список по пунктах у рядок —
+        # звичайна форма повідомлень каналів.
+        deep = reader.read(clean_lines(text))
         if len(deep["items"]) >= 2 and deep["ours"]:
+            list_mode = True
             names = set(deep["types"])
             found = [(n, e) for n, e in found if n in names]
 
@@ -1094,7 +1203,17 @@ def classify(text: str) -> dict | None:
     # лише контекст, не наша ціль. Якщо взяти й Чугуїв, кількість
     # цілей САМЕ на нього могла б помилково піднімати тривогу по
     # Васищевому чи Зміїву.
-    mass_places = ([geo.main_name()] if zmiiv else []) + close + near + extra
+    # Лише ті НП, що визначили рівень і причину сповіщення (у порядку
+    # пріоритету гілок нижче): місто → ближні села → дальній пояс/додаткові
+    # міста. Цифра з рядка про Чкаловське («3 на Шевченково, Чкаловское»)
+    # не має ставати «3 шахеди на Васищеве» лише тому, що обидва пункти
+    # є в одному повідомленні.
+    if zmiiv:
+        mass_places = [geo.main_name()]
+    elif close:
+        mass_places = list(close)
+    else:
+        mass_places = list(near) + list(extra)
 
     # --- Свої звуки / робота ППО -------------------------------------------
     if friendly and not (course and air):
@@ -1135,7 +1254,11 @@ def classify(text: str) -> dict | None:
         reason = "підліт через " + ", ".join(close[:3])
 
     # --- Средний уровень ----------------------------------------------------
-    elif (zmiiv or close or near) and impact:
+    # Зведення («Протягом минулої доби ворожих ударів зазнали…») — це
+    # ретроспектива: у ньому є і «прилетіло», і «Печеніги», і «Чугуїв»,
+    # але це не наслідки прильоту, що сталися щойно. Без цієї перевірки
+    # добова зведення ХОВА давала «ЧУГУЇВ · РАКЕТА · наслідки прильоту».
+    elif (zmiiv or close or near) and impact and not has_digest_marker(body):
         level, reason = "MEDIUM", "наслідки прильоту"
 
     elif district and air and not digest:
@@ -1185,7 +1308,8 @@ def classify(text: str) -> dict | None:
     else:
         confidence = "low"
 
-    mass = (mass_reason(low, threat_names, mass_places)
+    mass = (mass_reason(clean_lines(text).lower(), threat_names, mass_places,
+                        typed_here=list_mode)
             if level in ("HIGH", "MEDIUM") and not digest
             and confidence != "low" and not threat_gone(text) else None)
 

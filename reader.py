@@ -136,7 +136,8 @@ def items(text: str) -> list:
                 last_type = own[0]
             out.append({
                 "text": content,
-                "types": own or ([last_type] if last_type else []),
+                "types": own or ([header or last_type]
+                                 if (header or last_type) else []),
                 "own_types": own,
                 "header": header,
                 "main": geo.find_main(low),

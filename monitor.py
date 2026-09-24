@@ -74,6 +74,16 @@ SHORT_INTERVAL_SEC = 30
 REPORT_VOTE_MIN = 15
 
 # Журнал подій доби: скільки записів тримаємо і скільки показуємо у звіті.
+# Типи, які НЕ можна підказувати як «ймовірний тип» невідомої цілі.
+# Нові типи, поява яких у межах епізоду знову дає ЗВУК (загроза зросла).
+HEAVY_ESCALATION = {"Балістика", "Крилата ракета", "Ракета", "КАБ",
+                    "Бандероль"}
+# Скільки хвилин після ручного скасування тривоги повтори по тому самому
+# місцю йдуть без звуку.
+CANCEL_HOLD_MIN = 15
+
+GUESS_EXCLUDE = {"Артилерія", "Загроза пуску", "Розвідувальний"}
+
 EVENT_LOG_LIMIT = 60
 EVENT_SHOW_LIMIT = 8
 # За скільки годин назад уточнення «це було розмінування» ще стосується
@@ -187,7 +197,7 @@ def save_state(alarm, announced) -> None:
 # понятно, что произойдёт. Приходит при /start и /panel.
 PANEL_HELP = """🎛 <b>Керування радаром</b>
 
-⚪️ <b>Скасувати тривогу</b> — прибирає ХИБНУ тривогу: знімає активну ціль і зупиняє гучні повтори, але радар працює далі й наступну справжню загрозу підніме як звичайно. Саме це варто натискати, коли радар помилився, — замість паузи чи вимкнення звуку.
+⚪️ <b>Скасувати тривогу</b> — знімає тривогу вручну: активну ціль і гучні повтори. Радар працює далі. Натискайте, коли ціль уже збили, вона пішла чи вибухнула, а радар цього не побачив, — або коли він помилився. Ще 15 хвилин повідомлення про те саме місце йдуть без звуку; якщо загроза зросте (ракета, балістика, бандероль, 5+ цілей) — звук повернеться.
 
 ⏸ <b>Пауза</b> — радар слухає канали, але нічого не надсилає. Кнопка стає «Відновити».
 
@@ -304,8 +314,15 @@ def format_message(res: dict, channel: str, link: str, dup_src=None) -> str:
     # Радар не впевнений — так і кажемо, замість того щоб стверджувати
     if (res.get("confidence") == "low" and res["level"] != "INFO"
             and config.FILTER_CONFIDENCE):
-        head += ("<i>⚠️ Радар не впевнений: у повідомленні немає прямої "
-                 "згадки міста або типу загрози. Перевірте джерело.</i>\n")
+        if res["threats"] and not res.get("main_city"):
+            # Тип названо — брехати, що його немає, не можна. Насправді
+            # невпевненість в іншому: мова не про саме місто.
+            head += ("<i>⚠️ Радар не впевнений: це ціль на сусіднє село, "
+                     "про саме місто в повідомленні не йдеться. Перевірте "
+                     "джерело.</i>\n")
+        else:
+            head += ("<i>⚠️ Радар не впевнений: у повідомленні немає прямої "
+                     "згадки міста або типу загрози. Перевірте джерело.</i>\n")
 
     if dup_src:
         dup_channel, dup_link = dup_src
@@ -458,6 +475,11 @@ class Radar:
         self.recent_alerts = []         # (час, канал, посилання) — для позначки можливого дубляжу
         self.recent_sent = {}           # (тип, НП) -> (час, рівень): проти десяти сповіщень про одну ціль
         self.report_votes = []          # (час, канал, id) — зведення по області без нашої цілі
+        self.last_episode_start = None  # початок останнього епізоду «особливої небезпеки»
+        self.last_episode_kinds = set()
+        self.last_episode_count = 0
+        self.cancel_hold = None         # вікно тиші після ручного скасування
+        self.last_episode_end = None    # коли востаннє завершився епізод особливої небезпеки
         self.moved_away = False         # уже сказали «ціль пішла далі» — не дублювати «минула»
         self._wake_reason = None        # чому оновлюємо закріплене
         self.standby = False            # резерв мовчить, поки живий онлайн
@@ -1398,6 +1420,15 @@ class Radar:
                               info)
             return
 
+        # «Бандероли покидають нашу область, по балістиці загроза
+        # зберігається» — канал сам каже, що ЦЕЙ тип загрози пішов.
+        # Знімаємо тихо (без звуку) саме ту ціль, про яку йдеться, і
+        # лише її: по іншому типу з того ж повідомлення загроза лишається.
+        if config.CLEAR_THREAT and (self.active_threat or self.near_threat):
+            left = classify.threat_left(text)
+            if left:
+                await self._handle_left(left, text, src, date)
+
         # Ціль пішла в інший бік — це не відбій, казати «все добре» рано
         if self.active_threat and context:
             parent_clean = classify.clean(context).lower()
@@ -1744,7 +1775,20 @@ class Radar:
         # Зі звуком — лише коли радар упевнений. Невпевнений висновок
         # не має права будити: саме так планове розмінування колись
         # прийшло як «наслідки прильоту».
+        # ОБМЕЖЕННЯ ГУЧНОСТІ ПІД ЧАС НАЛЬОТУ. Уночі 24 вересня пройшло
+        # близько 30 шахедів різними групами, і радар видав 36 гучних
+        # HIGH та 218 звукових повторів — «монітор» довелось вимкнути
+        # на беззвучний, тобто радар перестав виконувати свою роботу.
+        # Перше повідомлення про загрозу цьому місцю — зі звуком. Поки
+        # епізод триває, наступні ПРО ТЕ САМЕ МІСЦЕ йдуть без звуку й
+        # без нових серій повторів. Звук повертається лише при
+        # ЗРОСТАННІ загрози: новий важкий тип (ракета, балістика,
+        # бандероль, КАБ) або явна кількість 5+ більша за попередню.
+        calm = False
+        if config.RAID_CALM and res["level"] == "HIGH":
+            calm = self._episode_covers(res)
         silent = (res["level"] != "HIGH"
+                  or calm
                   or (res.get("confidence") == "low"
                       and config.FILTER_CONFIDENCE)
                   or config.in_quiet_hours(datetime.now().hour)
@@ -1814,6 +1858,8 @@ class Radar:
                 if self.active_threat and self.active_threat["place"] == place:
                     self.active_threat["last_seen"] = now_ts
                     self.active_threat["last_src"] = src
+                    self._note_episode(self.active_threat, kind,
+                                       res.get("count") or 0)
                     # Тип не перезаписуємо, якщо він уже відомий: інакше
                     # згадка іншої зброї в тому самому місці (шахед і
                     # бандероль поруч) тихо підмінила б собою першу ціль,
@@ -1823,7 +1869,9 @@ class Radar:
                 else:
                     self.active_threat = {"place": place, "since": now_ts,
                                           "last_seen": now_ts, "kind": kind,
-                                          "last_src": src}
+                                          "last_src": src,
+                                          "kinds": [kind] if kind else [],
+                                          "max_count": res.get("count") or 0}
                     # Нова ціль — прапорець «уже сказали, що пішла далі»
                     # стосувався попередньої, скидаємо.
                     self.moved_away = False
@@ -1863,7 +1911,7 @@ class Radar:
 
             # Особлива небезпека: масова або важка загроза, або серія
             # гучних сповіщень підряд. Одна ціль повторів не дає.
-            if config.CRITICAL_ENABLED and res["level"] == "HIGH":
+            if config.CRITICAL_ENABLED and res["level"] == "HIGH" and not calm:
                 now_ts = datetime.now()
                 self.recent_high = [t for t in self.recent_high
                                     if now_ts - t < timedelta(minutes=10)]
@@ -1948,6 +1996,29 @@ class Radar:
         # привід знати, але не привід кричати десять разів: одна
         # коротка серія з рідшими повторами, і на цьому все.
         scale = "full" if res.get("main_city") else "short"
+        # ПАУЗА МІЖ ЕПІЗОДАМИ. Під час нальоту умови «особливої небезпеки»
+        # виконувались знову й знову, і радар відкривав новий епізод за
+        # новим — 17 за ніч, по 5 пачок кожен. Тепер новий епізод не
+        # раніше ніж через RAID_COOLDOWN_MIN хвилин після початку
+        # попереднього, окрім ЗРОСТАННЯ загрози (новий важкий тип чи
+        # кількість 5+, більша за попередню).
+        kind = res["threats"][0][0] if res["threats"] else ""
+        count = res.get("count") or 0
+        if config.RAID_CALM and self.last_episode_start:
+            since = now_ts - self.last_episode_start
+            if since < timedelta(minutes=config.RAID_COOLDOWN_MIN):
+                grew = ((kind in HEAVY_ESCALATION
+                         and kind not in self.last_episode_kinds)
+                        or (count >= 5 and count > self.last_episode_count))
+                if not grew:
+                    log.info("нова серія повторів не запускається: попередня "
+                             "почалась %d хв тому (пауза %d хв)",
+                             since.total_seconds() // 60,
+                             config.RAID_COOLDOWN_MIN)
+                    return
+        self.last_episode_start = now_ts
+        self.last_episode_kinds = {kind} if kind else set()
+        self.last_episode_count = count
         self.critical = {"short": short, "started": now_ts,
                          "last_event": now_ts, "last_burst": now_ts,
                          "bursts": 0, "src": src, "scale": scale}
@@ -1989,43 +2060,146 @@ class Radar:
         log.warning("надіслано пачку повторів %d з %d",
                     self.critical["bursts"], max_bursts)
 
+    async def _critical_tick(self) -> None:
+        """Одна перевірка епізоду особливої небезпеки (раз на 10 с)."""
+        if not self.critical:
+            return
+        now_ts = datetime.now()
+
+        # Эпизод закончился: давно нет новых сообщений или исчерпан лимит
+        quiet = now_ts - self.critical["last_event"]
+        _r, _i, max_bursts = self._burst_plan()
+        if (quiet > timedelta(minutes=config.CRITICAL_EPISODE_MIN)
+                or self.critical["bursts"] >= max_bursts
+                or self.active_threat is None):
+            log.info("епізод особливої небезпеки завершено (%d пачок)",
+                     self.critical["bursts"])
+            self.last_episode_end = now_ts
+            self.critical = None
+            return
+
+        # Обстрел продолжается — ещё пачка через минуту
+        if now_ts - self.critical["last_burst"] >= timedelta(minutes=1):
+            await self._send_burst()
+
     async def _critical_loop(self) -> None:
         """Повторяет пачки, пока угроза жива, но не больше лимита."""
         while True:
             await asyncio.sleep(10)
             try:
-                if not self.critical:
-                    continue
-                now_ts = datetime.now()
-
-                # Эпизод закончился: давно нет новых сообщений или исчерпан лимит
-                quiet = now_ts - self.critical["last_event"]
-                _r, _i, max_bursts = self._burst_plan()
-                if (quiet > timedelta(minutes=config.CRITICAL_EPISODE_MIN)
-                        or self.critical["bursts"] >= max_bursts
-                        or self.active_threat is None):
-                    log.info("епізод особливої небезпеки завершено (%d пачок)",
-                             self.critical["bursts"])
-                    self.critical = None
-                    continue
-
-                # Обстрел продолжается — ещё пачка через минуту
-                if now_ts - self.critical["last_burst"] >= timedelta(minutes=1):
-                    await self._send_burst()
+                await self._critical_tick()
             except Exception:                                # noqa: BLE001
                 log.exception("_critical_loop впав на цій ітерації — "
                               "продовжую")
 
+    @staticmethod
+    def _note_episode(threat: dict, kind: str, count: int) -> None:
+        """Запам'ятовує, які типи й яка найбільша кількість уже звучали."""
+        kinds = threat.setdefault("kinds", [])
+        if kind and kind not in kinds:
+            kinds.append(kind)
+        threat["max_count"] = max(threat.get("max_count", 0), count or 0)
+
+    @staticmethod
+    def _is_escalation(res: dict, known_kinds, max_count: int) -> bool:
+        """Загроза ЗРОСЛА: новий важкий тип або явна кількість 5+ і більша."""
+        kind = res["threats"][0][0] if res["threats"] else ""
+        if kind in HEAVY_ESCALATION and kind not in known_kinds:
+            return True
+        count = res.get("count") or 0
+        return count >= 5 and count > max_count
+
+    def _episode_covers(self, res: dict) -> bool:
+        """Чи вже триває епізод, про який користувача сповіщено зі звуком.
+
+        True — це повідомлення можна віддати без звуку й без серії
+        повторів. Епізод покриває місце, якщо активна ціль — саме це
+        місце АБО саме місто (про місто вже кричали, і сусіднє село
+        нічого нового не додає). Ручне «Скасувати тривогу» теж
+        відкриває таке «вікно тиші» для того самого місця.
+        """
+        main = geo.main_name()
+        spot = main if main in res["places"] else (
+            res["places"][0] if res["places"] else main)
+        known, top, covered = set(), 0, False
+        at = self.active_threat
+        if at and at["place"] in (spot, main):
+            covered = True
+            known |= set(at.get("kinds") or
+                         ([at["kind"]] if at.get("kind") else []))
+            top = at.get("max_count", 0)
+        hold = self.cancel_hold
+        if hold and datetime.now() < hold["until"] and hold["place"] in (
+                spot, main):
+            covered = True
+            known |= {hold["kind"]} if hold.get("kind") else set()
+            top = max(top, hold.get("count", 0))
+        if not covered:
+            return False
+        if self._is_escalation(res, known, top):
+            log.info("наліт: загроза зросла — звук лишається (%s)", spot)
+            return False
+        log.info("наліт: епізод уже триває — %s без звуку й повторів", spot)
+        return True
+
+    async def _handle_left(self, left: dict, text: str, src, date) -> None:
+        """Тихо знімає ціль, про яку канал повідомив «покинула область»."""
+        body = classify.clean(text)
+        for attr in ("active_threat", "near_threat"):
+            threat = getattr(self, attr)
+            if not threat:
+                continue
+            if not classify.left_matches(left, threat.get("kind", "")):
+                continue
+            # Допис старіший за останню згадку цілі — про попередній епізод
+            if date:
+                when = date.astimezone().replace(tzinfo=None)
+                if when <= threat["last_seen"]:
+                    continue
+            kinds = ", ".join(k.lower() for k in left["left"]) or "цілі"
+            sent = await self._announce(format_gone(
+                threat, f"канал повідомляє: {kinds} залишають область",
+                body[:250], src=src))
+            if not sent:
+                log.warning("зняття за «покинули область» НЕ надіслано")
+                continue
+            log.info("знято за повідомленням «покинули область»: %s (%s)",
+                     threat.get("place"), kinds)
+            setattr(self, attr, None)
+            if attr == "active_threat":
+                save_active_threat(None)
+                self.last_alert = None
+                self.critical = None
+                self.gone_votes.clear()
+                self.report_votes = []
+        if self._status_dirty:
+            self._status_dirty.set()
+
     async def cancel_alarm(self, who: str = "вручну") -> str:
-        """Скасовує ПОМИЛКОВУ тривогу, не вимикаючи радар.
+        """Знімає тривогу за рішенням власника, не вимикаючи радар.
+
+        Причин може бути багато, і «радар помилився» — лише одна з них.
+        Частіше навпаки: ціль була справжньою, але її збили, вона пішла
+        чи вибухнула, а радар цього не побачив і далі кричить. Тому
+        повідомлення НЕ називає тривогу хибною.
 
         Тиша на годину глушить усе підряд, пауза зупиняє роботу — а тут
-        треба інше: прибрати конкретну хибну ціль і повтори, лишивши
-        радар працювати далі. Наступна справжня загроза підніме тривогу
-        як звичайно.
+        треба інше: прибрати активну ціль і повтори, лишивши радар
+        працювати. Ще CANCEL_HOLD_MIN хвилин повідомлення про ТЕ САМЕ
+        місце йдуть без звуку й без нових серій, щоб та сама ціль,
+        про яку канали ще пишуть, не підняла тривогу знову. Зростання
+        загрози (новий важкий тип, більша кількість) звук повертає.
         """
         had = bool(self.critical or self.active_threat or self.near_threat)
-        place = (self.active_threat or self.near_threat or {}).get("place", "")
+        at = self.active_threat or self.near_threat or {}
+        place = at.get("place", "")
+        now = datetime.now()
+        if place:
+            self.cancel_hold = {
+                "place": place, "kind": at.get("kind", ""),
+                "count": at.get("max_count", 0),
+                "until": now + timedelta(minutes=CANCEL_HOLD_MIN)}
+        self.last_episode_start = now       # і нову серію відкладаємо
         self.critical = None
         self.active_threat = None
         self.near_threat = None
@@ -2033,24 +2207,80 @@ class Radar:
         self.gone_votes.clear()
         self.report_votes.clear()
         self.recent_high = []
-        self.recent_sent = {}
         self.moved_away = False
         save_active_threat(None)
         if self._status_dirty:
             self._status_dirty.set()
 
         if not had:
-            log.info("скасування тривоги (%s): активної цілі не було", who)
+            log.info("зняття тривоги (%s): активної цілі не було", who)
             return "Активної тривоги не було — закріплене оновлено."
 
-        log.warning("ТРИВОГУ СКАСОВАНО %s (ціль: %s)", who, place or "—")
+        log.warning("ТРИВОГУ ЗНЯТО %s (ціль: %s)", who, place or "—")
         await self._announce(
-            f"⚪️ <b>ТРИВОГУ СКАСОВАНО ВРУЧНУ</b>\n"
-            f"⚪️ Попереднє сповіщення{' про ' + escape(place) if place else ''}"
-            f" визнано хибним.\n"
-            f"\nРадар продовжує стежити — це не відбій офіційної тривоги."
-            f"\n\n<i>скасував власник радара о {datetime.now():%H:%M}</i>")
-        return f"Тривогу скасовано{(' · ' + place) if place else ''}"
+            f"⚪️ <b>ТРИВОГУ ЗНЯТО ВРУЧНУ</b>\n"
+            f"⚪️ Власник радара зняв тривогу"
+            f"{' по ' + escape(place) if place else ''}: ціль могла бути "
+            f"збита, піти чи вибухнути.\n"
+            f"\nРадар продовжує стежити — це не офіційний відбій."
+            f"\n\n<i>{now:%H:%M} · вручну</i>")
+        return f"Тривогу знято{(' · ' + place) if place else ''}"
+
+    async def _watch_tick(self) -> None:
+        """Одна перевірка «чи не замовкли канали» (раз на хвилину)."""
+        if config.CLEAR_THREAT and self.active_threat:
+            quiet = datetime.now() - self.active_threat["last_seen"]
+            if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
+                # Якщо вже сказали «ціль пішла далі» — знімаємо
+                # тихо: повторювати те саме іншими словами не
+                # треба, читач і так усе зрозумів.
+                if self.moved_away:
+                    log.info("ціль знята мовчки: про неї вже "
+                             "повідомили, що пішла далі")
+                    self.active_threat = None
+                    save_active_threat(None)
+                    self.last_alert = None
+                    self.critical = None
+                    self.moved_away = False
+                    if self._status_dirty:
+                        self._status_dirty.set()
+                    return
+                sent = await self._announce(
+                    format_gone(self.active_threat, ""))
+                if sent:
+                    log.info("загроза знята за мовчанням каналів "
+                            "(%d хв)", config.CLEAR_AFTER_MIN)
+                    self.active_threat = None
+                    save_active_threat(None)
+                    self.last_alert = None  # закріплене повертається у спокій
+                    self.critical = None
+                    if self._status_dirty:
+                        self._status_dirty.set()
+                else:
+                    # Не знімаємо мовчки, якщо повідомлення не
+                    # пішло — інакше закріплене «заспокоїться», а в
+                    # чат ніхто так і не дізнається, що загроза
+                    # минула. Спробуємо ще раз за хвилину.
+                    log.warning("зняття загрози НЕ надіслано — "
+                               "ціль залишаю активною до наступної "
+                               "спроби")
+
+        # Те саме, але для «поруч» (сусіднє село) — раніше такі
+        # цілі взагалі не знімались: «загроза минула» про них
+        # ніколи не приходила, і незрозуміло було, чи ще актуально.
+        if config.CLEAR_THREAT and self.near_threat:
+            quiet = datetime.now() - self.near_threat["last_seen"]
+            if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
+                sent = await self._announce(
+                    format_gone(self.near_threat, ""))
+                if sent:
+                    log.info("ціль «поруч» знята за мовчанням "
+                            "каналів (%d хв)", config.CLEAR_AFTER_MIN)
+                    self.near_threat = None
+                else:
+                    log.warning("зняття цілі «поруч» НЕ надіслано "
+                               "— залишаю активною до наступної "
+                               "спроби")
 
     async def _watch_threat(self) -> None:
         """Снимает угрозу, если каналы перестали о ней писать.
@@ -2061,59 +2291,7 @@ class Radar:
         while True:
             await asyncio.sleep(60)
             try:
-                if config.CLEAR_THREAT and self.active_threat:
-                    quiet = datetime.now() - self.active_threat["last_seen"]
-                    if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
-                        # Якщо вже сказали «ціль пішла далі» — знімаємо
-                        # тихо: повторювати те саме іншими словами не
-                        # треба, читач і так усе зрозумів.
-                        if self.moved_away:
-                            log.info("ціль знята мовчки: про неї вже "
-                                     "повідомили, що пішла далі")
-                            self.active_threat = None
-                            save_active_threat(None)
-                            self.last_alert = None
-                            self.critical = None
-                            self.moved_away = False
-                            if self._status_dirty:
-                                self._status_dirty.set()
-                            continue
-                        sent = await self._announce(
-                            format_gone(self.active_threat, ""))
-                        if sent:
-                            log.info("загроза знята за мовчанням каналів "
-                                    "(%d хв)", config.CLEAR_AFTER_MIN)
-                            self.active_threat = None
-                            save_active_threat(None)
-                            self.last_alert = None  # закріплене повертається у спокій
-                            self.critical = None
-                            if self._status_dirty:
-                                self._status_dirty.set()
-                        else:
-                            # Не знімаємо мовчки, якщо повідомлення не
-                            # пішло — інакше закріплене «заспокоїться», а в
-                            # чат ніхто так і не дізнається, що загроза
-                            # минула. Спробуємо ще раз за хвилину.
-                            log.warning("зняття загрози НЕ надіслано — "
-                                       "ціль залишаю активною до наступної "
-                                       "спроби")
-
-                # Те саме, але для «поруч» (сусіднє село) — раніше такі
-                # цілі взагалі не знімались: «загроза минула» про них
-                # ніколи не приходила, і незрозуміло було, чи ще актуально.
-                if config.CLEAR_THREAT and self.near_threat:
-                    quiet = datetime.now() - self.near_threat["last_seen"]
-                    if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
-                        sent = await self._announce(
-                            format_gone(self.near_threat, ""))
-                        if sent:
-                            log.info("ціль «поруч» знята за мовчанням "
-                                    "каналів (%d хв)", config.CLEAR_AFTER_MIN)
-                            self.near_threat = None
-                        else:
-                            log.warning("зняття цілі «поруч» НЕ надіслано "
-                                       "— залишаю активною до наступної "
-                                       "спроби")
+                await self._watch_tick()
             except Exception:                                # noqa: BLE001
                 log.exception("_watch_threat впав на цій ітерації — "
                               "продовжую")
@@ -2401,7 +2579,14 @@ class Radar:
             return ""
         counts = {}
         for _when, name in self.recent_types:
+            # Артилерія й «загроза пуску» — не повітряні цілі: підказка
+            # «ймовірно артилерія» для сповіщення про ціль на село
+            # виглядала абсурдно й нічого не пояснювала.
+            if name in GUESS_EXCLUDE:
+                continue
             counts[name] = counts.get(name, 0) + 1
+        if not counts:
+            return ""
         name, hits = max(counts.items(), key=lambda kv: kv[1])
         return name if hits >= 2 else ""
 

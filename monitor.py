@@ -1855,9 +1855,17 @@ class Radar:
                 place = main if main in res["places"] else (
                     res["places"][0] if res["places"] else main)
                 kind = res["threats"][0][0] if res["threats"] else ""
+                # Чи було сповіщення ЗІ ЗВУКОМ — лише тоді епізод «покриває»
+                # наступні повідомлення (див. _episode_covers). Тихе MEDIUM
+                # («згадка міста», розвідник) теж створює активну ціль, але
+                # про неї ніхто не кричав — справжній HIGH одразу після
+                # нього мусить прозвучати.
+                loud_now = res["level"] == "HIGH" and not silent
                 if self.active_threat and self.active_threat["place"] == place:
                     self.active_threat["last_seen"] = now_ts
                     self.active_threat["last_src"] = src
+                    if loud_now:
+                        self.active_threat["loud"] = True
                     self._note_episode(self.active_threat, kind,
                                        res.get("count") or 0)
                     # Тип не перезаписуємо, якщо він уже відомий: інакше
@@ -1871,7 +1879,8 @@ class Radar:
                                           "last_seen": now_ts, "kind": kind,
                                           "last_src": src,
                                           "kinds": [kind] if kind else [],
-                                          "max_count": res.get("count") or 0}
+                                          "max_count": res.get("count") or 0,
+                                          "loud": loud_now}
                     # Нова ціль — прапорець «уже сказали, що пішла далі»
                     # стосувався попередньої, скидаємо.
                     self.moved_away = False
@@ -2123,7 +2132,7 @@ class Radar:
             res["places"][0] if res["places"] else main)
         known, top, covered = set(), 0, False
         at = self.active_threat
-        if at and at["place"] in (spot, main):
+        if at and at["place"] in (spot, main) and at.get("loud"):
             covered = True
             known |= set(at.get("kinds") or
                          ([at["kind"]] if at.get("kind") else []))

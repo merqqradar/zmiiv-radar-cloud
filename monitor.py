@@ -405,6 +405,29 @@ def format_gone(threat: dict, wording: str, source: str = "", src=None) -> str:
     return head + body + tail + "\n\n<i>висновок радара: мовчання каналів</i>"
 
 
+def format_partial(threat: dict, others: list, wording: str = "",
+                   source: str = "", src=None) -> str:
+    """Одну ціль знято, але загроза ще є — НЕ зелене й без звуку.
+
+    Зелене з'являється лише коли не лишилось жодної цілі: інакше в чаті
+    виходить «відбій», а в закріпленому досі «загроза».
+    """
+    when = threat["since"]
+    left = ", ".join(o["place"] + (f" ({o['kind'].lower()})"
+                                   if o.get("kind") else "")
+                     for o in others)
+    head = (f"🔴 <b>{escape(threat['place']).upper()} · ЦІЛЬ БІЛЬШЕ НЕ "
+            f"ЗГАДУЄТЬСЯ</b>\n")
+    body = (f"🔴 Ця ціль була о {when:%H:%M}"
+            f"{' · ' + escape(wording) if wording else ''}.\n"
+            f"❗️ <b>Загроза лишається:</b> {escape(left)}\n"
+            f"\nЦе <b>не відбій</b> — радар стежить за рештою цілей.")
+    if source:
+        body += f"\n\n{escape(source)[:250]}"
+    tail = source_line(src or threat.get("last_src"))
+    return head + body + (tail or "")
+
+
 def format_short(text: str, place_time, src=None) -> str:
     """Очень короткое повторное сообщение — чтобы разбудить."""
     tail = ""
@@ -676,13 +699,13 @@ class Radar:
                             # замовкли»: це різні речі, і радар не має
                             # права видавати одне за інше.
                             src = self.review.get("city_gone_link")
-                            msg = format_gone(
-                                self.active_threat,
+                            sent = await self._announce_gone(
+                                "active_threat", self.active_threat,
                                 self.review.get("city_gone_wording", ""),
                                 self.review.get("city_gone_text", ""), src)
                         else:
-                            msg = format_gone(self.active_threat, "")
-                        sent = await self._announce(msg)
+                            sent = await self._announce_gone(
+                                "active_threat", self.active_threat)
                         if sent:
                             log.info("загроза знята за смарт-перевіркою "
                                     "(кнопка, %s)",
@@ -1044,7 +1067,7 @@ class Radar:
                 # непомітно для будь-кого.
                 log.exception("_standby_tick впав — пропускаю цю перевірку")
 
-    async def _announce(self, text: str) -> bool:
+    async def _announce(self, text: str, loud: bool = False) -> bool:
         """Шлёт объявление тривоги/відбою в канал. Завжди без звуку.
 
         Повертає, чи справді пішло повідомлення — щоб виклики, які потім
@@ -1053,7 +1076,8 @@ class Radar:
         """
         if self.standby or self.paused:
             return False
-        ok, info = await asyncio.to_thread(notify.send, text, True)
+        ok, info = await asyncio.to_thread(
+            notify.send, text, not (loud and not self.is_muted()))
         if ok:
             self.stats["sent"] += 1
             self.counts["ALARM"] = self.counts.get("ALARM", 0) + 1
@@ -1493,8 +1517,9 @@ class Radar:
                         + source_line(src))
                     log.info("зняття загрози: 1 голос (%s)", username)
                 else:
-                    sent = await self._announce(format_gone(
-                        self.active_threat, gone[0], gone[1], src=src))
+                    sent = await self._announce_gone(
+                        "active_threat", self.active_threat,
+                        gone[0], gone[1], src)
                     if sent:
                         log.info("знято загрозу: %d канали підтвердили", votes)
                         self.active_threat = None
@@ -1565,12 +1590,12 @@ class Radar:
                     log.info("зведення по області без цілі %s: %d з %d",
                              place, votes, config.REPORT_CLEAR_VOTES)
                     if votes >= config.REPORT_CLEAR_VOTES:
-                        sent = await self._announce(format_gone(
-                            self.active_threat,
+                        sent = await self._announce_gone(
+                            "active_threat", self.active_threat,
                             "у свіжих зведеннях по області цілі вже немає",
                             f"Перевірено за {votes} зведеннями обстановки "
                             f"по області — ця ціль у них більше не згадується.",
-                            src=src))
+                            src)
                         if sent:
                             log.info("ціль знята за зведеннями (%d)", votes)
                             self.active_threat = None
@@ -2151,6 +2176,23 @@ class Radar:
         log.info("наліт: епізод уже триває — %s без звуку й повторів", spot)
         return True
 
+    def _others_left(self, attr: str) -> list:
+        """Інші цілі, що лишаються активними, крім тієї, яку знімаємо."""
+        other = "near_threat" if attr == "active_threat" else "active_threat"
+        t = getattr(self, other)
+        return [t] if t else []
+
+    async def _announce_gone(self, attr: str, threat: dict, wording: str = "",
+                             source: str = "", src=None) -> bool:
+        """«Ціль минула»: зелене (зі звуком) лише якщо це остання ціль."""
+        others = self._others_left(attr)
+        if others:
+            return await self._announce(
+                format_partial(threat, others, wording, source, src))
+        return await self._announce(
+            format_gone(threat, wording, source, src=src),
+            loud=(attr == "active_threat" and bool(threat.get("loud"))))
+
     async def _handle_left(self, left: dict, text: str, src, date) -> None:
         """Тихо знімає ціль, про яку канал повідомив «покинула область»."""
         body = classify.clean(text)
@@ -2166,9 +2208,22 @@ class Radar:
                 if when <= threat["last_seen"]:
                     continue
             kinds = ", ".join(k.lower() for k in left["left"]) or "цілі"
-            sent = await self._announce(format_gone(
-                threat, f"канал повідомляє: {kinds} залишають область",
-                body[:250], src=src))
+            # Було кілька типів (шахед + ракети), пішов лише один — ціль
+            # лишається, знімаємо тільки цей тип, без «відбою».
+            held = [k for k in (threat.get("kinds") or [])
+                    if not classify.left_matches(left, k)]
+            if held:
+                threat["kinds"] = held
+                threat["kind"] = held[0]
+                sent = await self._announce(format_partial(
+                    threat, [threat], f"канал повідомляє: {kinds} "
+                    f"залишають область", body[:250], src))
+                log.info("частково знято (%s), лишається: %s", kinds, held)
+                save_active_threat(self.active_threat)
+                continue
+            sent = await self._announce_gone(
+                attr, threat, f"канал повідомляє: {kinds} залишають область",
+                body[:250], src)
             if not sent:
                 log.warning("зняття за «покинули область» НЕ надіслано")
                 continue
@@ -2254,8 +2309,8 @@ class Radar:
                     if self._status_dirty:
                         self._status_dirty.set()
                     return
-                sent = await self._announce(
-                    format_gone(self.active_threat, ""))
+                sent = await self._announce_gone(
+                    "active_threat", self.active_threat)
                 if sent:
                     log.info("загроза знята за мовчанням каналів "
                             "(%d хв)", config.CLEAR_AFTER_MIN)
@@ -2280,8 +2335,8 @@ class Radar:
         if config.CLEAR_THREAT and self.near_threat:
             quiet = datetime.now() - self.near_threat["last_seen"]
             if quiet > timedelta(minutes=config.CLEAR_AFTER_MIN):
-                sent = await self._announce(
-                    format_gone(self.near_threat, ""))
+                sent = await self._announce_gone(
+                    "near_threat", self.near_threat)
                 if sent:
                     log.info("ціль «поруч» знята за мовчанням "
                             "каналів (%d хв)", config.CLEAR_AFTER_MIN)

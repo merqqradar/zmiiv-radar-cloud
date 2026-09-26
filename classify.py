@@ -1173,6 +1173,41 @@ def classify(text: str) -> dict | None:
             found = [(n, e) for n, e in found if n in names]
 
     threat_names = [n for n, _ in found]
+
+    # У списку село-тезка визначається по СВОЄМУ рядку, а не по всьому
+    # повідомленню: «на Андреевку, Садовод» у сусідньому рядку не
+    # має «псувати» справжню Андріївку і навпаки.
+    if deep and len(deep["items"]) >= 2 and near:
+        item_near = {n for it in deep["items"] for n in it["near"]}
+        near = [n for n in near if n in item_near]
+
+    # FPV і «Ланцет» — фронтова зброя, до нашої глибини не долітає.
+    # «FPV на Андріївку, Садовод» у зведенні по області — це майже напевно
+    # ІНША Андріївка (їх багато), а не наша. Тому на ближньому поясі це
+    # не «ціль курсом», а помітка: радар не впевнений і каже про це прямо.
+    # Якщо FPV названо на саме місто чи ближнє село — це лишається серйозною
+    # загрозою і йде звичайним шляхом нижче.
+    if (config.SMART_READ and near and set(near) <= {"Андріївка"}
+            and not (zmiiv or close or extra)
+            and threat_names and set(threat_names) <= {"FPV", "Ланцет"}):
+        place = ", ".join(near[:2])
+        kind = threat_names[0]
+        return {
+            "level": "INFO",
+            "reason": f"{kind}: ймовірно, не наша {place}",
+            "places": near,
+            "threats": threat_names,
+            "text": body,
+            "note": (f"{kind} — фронтова зброя, до нас не долітає. "
+                     f"Назва «{place}» є в багатьох місцях області; у "
+                     f"повідомленні немає нічого, що вказувало б саме на "
+                     f"наше село. Радар вважає, що це НЕ наша "
+                     f"{place}, але не впевнений — перевірте джерело."),
+            "confidence": "low", "main_city": False, "near_home": False,
+            "watch": True,
+            "key": dedup_key("INFO", near, ["fpv-не-наше"], body),
+        }
+
     # Артиллерия/обстрелы до Змієва не долетают — как признак воздушной
     # угрозы не годится. Разведывательные БпЛА и FPV тоже не повод будить:
     # они не бьют по городу. И то и другое даёт максимум MEDIUM.

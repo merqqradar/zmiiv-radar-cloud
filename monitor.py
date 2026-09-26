@@ -300,6 +300,8 @@ def format_message(res: dict, channel: str, link: str, dup_src=None) -> str:
     if res["level"] in ("LOW", "INFO"):
         body = escape(classify.alert_head(res["text"]).strip())[:400]
         head = f"{top}\n{icon} {title} · {escape(res['reason'])}\n"
+        if res.get("note"):
+            head += f"<i>⚠️ {escape(res['note'])}</i>\n"
     else:
         threat = " ".join(f"{e} {n}" for n, e in res["threats"])
         if not threat:

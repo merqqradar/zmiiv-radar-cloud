@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import logging.handlers
+import re
 from datetime import datetime, timedelta, timezone
 from html import escape
 
@@ -506,6 +507,7 @@ class Radar:
         self.cancel_hold = None         # вікно тиші після ручного скасування
         self.last_episode_end = None    # коли востаннє завершився епізод особливої небезпеки
         self.moved_away = False         # уже сказали «ціль пішла далі» — не дублювати «минула»
+        self._last_msg_id = None        # id останнього надісланого _announce — для ланцюжка відповідей
         self._wake_reason = None        # чому оновлюємо закріплене
         self.standby = False            # резерв мовчить, поки живий онлайн
         self.mute_until = None          # тиша на годину: звук тимчасово вимкнено
@@ -1069,20 +1071,37 @@ class Radar:
                 # непомітно для будь-кого.
                 log.exception("_standby_tick впав — пропускаю цю перевірку")
 
-    async def _announce(self, text: str, loud: bool = False) -> bool:
+    async def _announce(self, text: str, loud: bool = False,
+                        reply_to: int | None = None) -> bool:
         """Шлёт объявление тривоги/відбою в канал. Завжди без звуку.
 
         Повертає, чи справді пішло повідомлення — щоб виклики, які потім
         пишуть у лог «дослано», не брехали, коли резерв мовчки нічого
         не надіслав (self.standby/self.paused).
+
+        reply_to — id попереднього ПОВІДОМЛЕННЯ РАДАРА, щоб відповісти
+        на нього: ціль поруч, а тепер, схоже, летить на саме місто —
+        видно ланцюжок, а не окрему нову подію. self._last_msg_id після
+        вдалої відправки завжди оновлюється — виклик, що впевнений у
+        продовженні тієї самої цілі, бере його ДО виклику й передає сюди.
         """
+        self._last_msg_id = None
         if self.standby or self.paused:
             return False
+        # Тумблер — експериментальна функція, вимикається окремо.
+        # Радар відповідає лише тоді, коли впевнений, що це ТА САМА
+        # ціль (виклики самі це гарантують, передаючи reply_to лише
+        # для власного ж активного епізоду) — тут лише вимикач.
+        if not config.CHAIN_REPLIES:
+            reply_to = None
         ok, info = await asyncio.to_thread(
-            notify.send, text, not (loud and not self.is_muted()))
+            notify.send, text, not (loud and not self.is_muted()), reply_to)
         if ok:
             self.stats["sent"] += 1
             self.counts["ALARM"] = self.counts.get("ALARM", 0) + 1
+            m = re.search(r"msg_id=(\d+)", info or "")
+            if m:
+                self._last_msg_id = int(m.group(1))
         else:
             self.stats["errors"] += 1
             log.error("оголошення НЕ надіслано: %s", info)
@@ -1458,14 +1477,31 @@ class Radar:
         # Ціль пішла в інший бік — це не відбій, казати «все добре» рано
         if self.active_threat and context:
             parent_clean = classify.clean(context).lower()
-            away = (classify.moved_away(text)
-                    if geo.find_zmiiv(parent_clean) else None)
+            # Канали часто ведуть ціль ланцюжком відповідей: «на Зміїв» →
+            # «продовжує рух на Мерефу» → «далі на Таранівку». Лише перший
+            # крок згадує сам Зміїв — далі йдеться вже про проміжні села, і
+            # без цього кожен наступний крок (Мерефа, Таранівка — вони теж
+            # у ближньому поясі) читався б як НОВА окрема ціль замість
+            # продовження тієї самої, що вже йде геть.
+            parent_ours = (geo.find_zmiiv(parent_clean)
+                          or (threats.has_course(parent_clean)
+                              and (geo.find_close(parent_clean)
+                                  or geo.find_near(parent_clean))))
+            away = (classify.moved_away(text) if parent_ours else None)
             if away:
+                # Відповідаємо на своє ж попереднє повідомлення про ЦЮ
+                # САМУ ціль — так у чаті видно ланцюжок («на Слобожанське»
+                # → «пішла далі, на Мерефу»), а не окрему нову подію.
+                root = self.active_threat.get("msg_id")
                 await self._announce(
                     f"🟡 <b>ЦІЛЬ ПІШЛА ДАЛІ → {escape(away)}</b>\n"
                     f"🟡 Загроза Змієву зменшилась, але це <b>не відбій</b>.\n"
                     f"Ціль може повернутися. Залишайтесь в укритті "
-                    f"до офіційного відбою." + source_line(src))
+                    f"до офіційного відбою." + source_line(src),
+                    reply_to=root)
+                if self._last_msg_id:
+                    self.active_threat["msg_id"] = self._last_msg_id
+                    save_active_threat(self.active_threat)
                 log.info("ціль пішла далі: %s", away)
                 # Про цю ціль уже сказано. Через 10 хвилин тиші не треба
                 # присилати ще й «загроза, скоріше за все, минула» — це
@@ -1584,11 +1620,11 @@ class Radar:
                 same_kind = (not kind or kind in report["types"]
                             or (kind == "Ракета" and "Бандероль" in report["types"]))
                 if (place != main and main in report["places"] and same_kind):
+                    root = self.active_threat.get("msg_id")
                     self.active_threat.update({
                         "place": main, "last_seen": now_rep, "last_src": src,
                         "loud": True})
                     self.report_votes = []
-                    save_active_threat(self.active_threat)
                     await self._announce(
                         f"🔴 <b>{main.upper()} · ЦІЛЬ ТЕПЕР КУРСОМ НА МІСТО</b>\n"
                         f"🔴 За свіжим зведенням по області ціль "
@@ -1596,7 +1632,10 @@ class Radar:
                         f"що була біля {escape(place)}, тепер летить "
                         f"на сам {main}.\n"
                         f"❗️ <b>Загроза зросла — це не відбій.</b>"
-                        + source_line(src), loud=True)
+                        + source_line(src), loud=True, reply_to=root)
+                    if self._last_msg_id:
+                        self.active_threat["msg_id"] = self._last_msg_id
+                    save_active_threat(self.active_threat)
                     log.info("ціль зі зведення перейшла на %s (була біля %s)",
                              main, place)
                     if self._status_dirty:
@@ -1848,6 +1887,13 @@ class Radar:
                   or self.is_muted())
         ok, info = await asyncio.to_thread(
             notify.send, format_message(res, username, link, dup_src), silent)
+        # id щойно відправленого — щоб наступне повідомлення про ЦЮ САМУ
+        # ціль (ескалація на саме місто, «пішла далі», зняття) могло
+        # відповісти на нього й у чаті було видно ланцюжок однієї цілі.
+        sent_msg_id = None
+        if ok:
+            m = re.search(r"msg_id=(\d+)", info or "")
+            sent_msg_id = int(m.group(1)) if m else None
         if ok:
             if relevant:
                 self.recent_alerts.append((datetime.now(), username, link))
@@ -1919,6 +1965,8 @@ class Radar:
                     self.active_threat["last_src"] = src
                     if loud_now:
                         self.active_threat["loud"] = True
+                    if sent_msg_id:
+                        self.active_threat["msg_id"] = sent_msg_id
                     self._note_episode(self.active_threat, kind,
                                        res.get("count") or 0)
                     # Тип не перезаписуємо, якщо він уже відомий: інакше
@@ -1933,7 +1981,8 @@ class Radar:
                                           "last_src": src,
                                           "kinds": [kind] if kind else [],
                                           "max_count": res.get("count") or 0,
-                                          "loud": loud_now}
+                                          "loud": loud_now,
+                                          "msg_id": sent_msg_id}
                     # Нова ціль — прапорець «уже сказали, що пішла далі»
                     # стосувався попередньої, скидаємо.
                     self.moved_away = False
@@ -2213,13 +2262,18 @@ class Radar:
     async def _announce_gone(self, attr: str, threat: dict, wording: str = "",
                              source: str = "", src=None) -> bool:
         """«Ціль минула»: зелене (зі звуком) лише якщо це остання ціль."""
+        # Відповідаємо на ланцюжок повідомлень про цю саму ціль — «минула»
+        # логічно завершує тред, а не висить окремим повідомленням.
+        root = threat.get("msg_id")
         others = self._others_left(attr)
         if others:
             return await self._announce(
-                format_partial(threat, others, wording, source, src))
+                format_partial(threat, others, wording, source, src),
+                reply_to=root)
         return await self._announce(
             format_gone(threat, wording, source, src=src),
-            loud=(attr == "active_threat" and bool(threat.get("loud"))))
+            loud=(attr == "active_threat" and bool(threat.get("loud"))),
+            reply_to=root)
 
     async def _handle_left(self, left: dict, text: str, src, date) -> None:
         """Тихо знімає ціль, про яку канал повідомив «покинула область»."""

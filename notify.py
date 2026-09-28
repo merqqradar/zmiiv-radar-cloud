@@ -163,15 +163,27 @@ def call(method: str, payload: dict) -> tuple:
     return _call(method, payload, retries=1)
 
 
-def send(text: str, silent: bool = False) -> tuple:
-    """Отправляет сообщение. Возвращает (успех, описание)."""
-    ok, res = _call("sendMessage", {
+def send(text: str, silent: bool = False, reply_to: int | None = None) -> tuple:
+    """Отправляет сообщение. Возвращает (успех, описание).
+
+    reply_to — id попереднього повідомлення в каналі, на яке відповідаємо:
+    так радар веде ту саму ціль ланцюжком відповідей, як це роблять самі
+    канали моніторингу («на Слобожанське» → «тепер на Зміїв»), і в чаті
+    видно, що це продовження, а не окрема нова подія. Якщо те повідомлення
+    вже видалили чи його немає — Telegram все одно надішле звичайним, без
+    відповіді (allow_sending_without_reply).
+    """
+    payload = {
         "chat_id": config.TARGET_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
         "disable_notification": silent,
-    })
+    }
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+        payload["allow_sending_without_reply"] = True
+    ok, res = _call("sendMessage", payload)
     if ok:
         return True, f"msg_id={res.get('message_id')}"
     return False, res

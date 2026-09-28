@@ -38,7 +38,7 @@ IS_CLOUD = os.getenv("RADAR_IS_CLOUD", "").strip() == "1"
 # Єдиний номер версії радара. Показується у вікні застосунку, поруч
 # з назвою «Радар Зміїв». Піднімати на одиницю при кожному помітному
 # оновленні — і в застосунку, і в назві файлу архіву при збірці.
-VERSION = "4.5"
+VERSION = "4.6"
 
 # Читаем .env (файл создаёт и заполняет владелец проекта вручную)
 load_dotenv(BASE_DIR / ".env")
@@ -115,6 +115,7 @@ REPORT_CLEAR_VOTES = _S["report_clear_votes"]
 REPEAT_WINDOW_MIN = _S["repeat_window_min"]
 RAID_CALM = _S["raid_calm"]
 RAID_COOLDOWN_MIN = _S["raid_cooldown_min"]
+CHAIN_REPLIES = _S["chain_replies"]
 ROLE = _S["role"]
 OWNER_ID = _S["owner_id"]
 
@@ -176,7 +177,7 @@ def reload_settings() -> dict:
     global SMART_REVIEW, REVIEW_MINUTES, REVIEW_LIMIT
     global SMART_EXPLAIN, SMART_BEFORE_SERIES, DUP_NOTICE_ENABLED
     global SMART_READ, REPORT_CLEAR, REPORT_CLEAR_VOTES, REPEAT_WINDOW_MIN
-    global RAID_CALM, RAID_COOLDOWN_MIN
+    global RAID_CALM, RAID_COOLDOWN_MIN, CHAIN_REPLIES
     global ROLE, OWNER_ID, TELEGRAM_CONTROL, TARGET_CHAT_ID, BOT_TOKEN
     global CITY_2_ON, CITY_3_ON
     global CITY_MAIN_NAME, CITY_MAIN_VARIANTS, CITY_2_NAME, CITY_2_VARIANTS
@@ -227,6 +228,7 @@ def reload_settings() -> dict:
     REPEAT_WINDOW_MIN = s["repeat_window_min"]
     RAID_CALM = s["raid_calm"]
     RAID_COOLDOWN_MIN = s["raid_cooldown_min"]
+    CHAIN_REPLIES = s["chain_replies"]
     ROLE = s["role"]
     OWNER_ID = s["owner_id"]
     TARGET_CHAT_ID = (s.get("target_chat_id") or "").strip() or \

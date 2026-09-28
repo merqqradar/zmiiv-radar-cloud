@@ -1572,10 +1572,36 @@ class Radar:
             if report:
                 now_rep = datetime.now()
                 place = self.active_threat["place"]
-                self.report_votes = [
-                    v for v in self.report_votes
-                    if now_rep - v[0] < timedelta(minutes=REPORT_VOTE_MIN)]
-                if place in report["places"]:
+                main = geo.main_name()
+
+                # Свіже зведення каже, що та сама зброя тепер летить на
+                # САМ Зміїв, а не на сусіднє село. Це не «ціль зникла» —
+                # навпаки, загроза зросла. Раніше радар бачив лише, що
+                # старого місця (Слобожанське) у зведенні вже немає, і
+                # знімав тривогу зеленим — хоча та сама бандероль уже
+                # йшла на місто.
+                kind = self.active_threat.get("kind", "")
+                same_kind = (not kind or kind in report["types"]
+                            or (kind == "Ракета" and "Бандероль" in report["types"]))
+                if (place != main and main in report["places"] and same_kind):
+                    self.active_threat.update({
+                        "place": main, "last_seen": now_rep, "last_src": src,
+                        "loud": True})
+                    self.report_votes = []
+                    save_active_threat(self.active_threat)
+                    await self._announce(
+                        f"🔴 <b>{main.upper()} · ЦІЛЬ ТЕПЕР КУРСОМ НА МІСТО</b>\n"
+                        f"🔴 За свіжим зведенням по області ціль "
+                        f"({', '.join(report['types']) or kind or 'ціль'}), "
+                        f"що була біля {escape(place)}, тепер летить "
+                        f"на сам {main}.\n"
+                        f"❗️ <b>Загроза зросла — це не відбій.</b>"
+                        + source_line(src), loud=True)
+                    log.info("ціль зі зведення перейшла на %s (була біля %s)",
+                             main, place)
+                    if self._status_dirty:
+                        self._status_dirty.set()
+                elif place in report["places"]:
                     # Ціль усе ще в зведенні — усі попередні голоси
                     # недійсні, відлік починається заново.
                     if self.report_votes:

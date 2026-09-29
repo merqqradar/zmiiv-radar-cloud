@@ -657,6 +657,17 @@ MASS_WORDS = ["залп", "масован", "массирован", "масов"
 HEAVY = {"Балістика", "Крилата ракета", "Ракета", "КАБ", "Бандероль",
          "Швидкісна ціль"}
 
+# «Реактивний шахед» — швидший, з двигуном (Shahed-238 і подібні), а не
+# звичайний гвинтовий. У threats.py це той самий тип «Шахед» (корені
+# «реактив»/«реактивн» там же), тому окремо перевіряємо цей корінь, коли
+# треба відрізнити його на дальньому «кільці» Мерефа/Чугуїв.
+REACTIVE_RE = re.compile(r"(?<!\w)реактив")
+
+# На дальньому «кільці» (Мерефа/Чугуїв і супутники) звичайний шахед і
+# ланцет майже напевно летять туди ж (чи ще далі) — писати про них
+# нема сенсу. «Реактивний» шахед сюди НЕ входить: то окрема перевірка.
+RING_SKIP = {"Шахед", "Ланцет"}
+
 # Розвідувальні БпЛА не будять: вони дивляться, а не б'ють.
 # FPV сюди НЕ входить: більшість FPV — ударні, це справжня загроза.
 QUIET_TYPES = {"Розвідувальний", "Загроза пуску"}
@@ -1138,10 +1149,13 @@ def classify(text: str) -> dict | None:
     extra = geo.find_extra(geo_low)
     near = geo.find_near(geo_low) if config.SEND_NEAR else []
     close = geo.find_close(geo_low)
-    far = geo.find_far(geo_low)
+    # far — те саме «кільце» Мерефа/Чугуїв, що й near (дивись HEAVY/FPV
+    # нижче): без цієї гілки повідомлення лише про Чугуїв відкидалось б
+    # тут же, ще до перевірки типу зброї.
+    far = geo.find_far(geo_low) if config.SEND_NEAR else []
     district = geo.find_district(geo_low)
 
-    if not (zmiiv or close or district or extra or near):
+    if not (zmiiv or close or district or extra or near or far):
         if friendly:
             places = [p for p in geo.find_close(geo_low)] or (
                 ["Харківщина"] if geo.find_oblast(geo_low) else [])
@@ -1242,6 +1256,7 @@ def classify(text: str) -> dict | None:
     calm = threats.is_calm(low)
     impact = threats.is_impact(low)
     digest = is_digest(body)
+    watch = False          # жовта позначка (🟡) замість звичайного 🟠
 
     places = ([geo.main_name()] if zmiiv else []) + close + far + extra + near
     # Для підрахунку «масовості» far (Чугуїв і т.п.) не годиться: це
@@ -1316,12 +1331,41 @@ def classify(text: str) -> dict | None:
     elif close and course and config.SEND_NEAR and not digest and not air:
         level, reason = "MEDIUM", f"ціль курсом через {', '.join(close[:2])}"
 
-    elif near and course and not digest and not (zmiiv or close):
-        level, reason = "MEDIUM", f"ціль курсом на {', '.join(near[:2])}"
-
-    elif near and air and course and not digest and not (zmiiv or close):
-        level = "MEDIUM"
-        reason = f"ціль поруч: {', '.join(near[:3])}"
+    # --- «Кільце» Мерефа/Чугуїв: цілі туди ще не наші, і тип зброї тут —
+    # головне. Звичайний шахед/ланцет/розвідник на Мерефу чи Чугуїв
+    # найімовірніше туди й летить (чи ще далі) — нічого не кажемо, це
+    # просто зайвий шум. А важка зброя (балістика, ракета, КАБ,
+    # бандероль — список HEAVY) чи ФПВ на такій відстані (25–55 км) —
+    # привід знати: перша долітає швидко, а ФПВ там узагалі не мало б
+    # бути, і сама його поява там — вже нова інформація.
+    elif ((near or far) and course and config.SEND_NEAR and not digest
+          and not (zmiiv or close or district or extra)):
+        ring = list(near) + list(far)
+        heavy_here = [n for n in threat_names if n in HEAVY]
+        reactive = (any(n == "Шахед" for n in threat_names)
+                    and REACTIVE_RE.search(low))
+        fpv_here = "FPV" in threat_names
+        # Звичайний шахед/ланцет туди й летить (чи ще далі) — писати
+        # нема сенсу. А ось невідомий/незвичний тип (Молния, просто
+        # «БпЛА» без уточнення) міг раніше давати звичайне тихе
+        # сповіщення — це не чіпаємо, лише важке/ФПВ підсилюємо.
+        skip_only = (threat_names
+                    and all(n in RING_SKIP for n in threat_names)
+                    and not reactive)
+        if skip_only:
+            return None
+        if heavy_here or reactive or fpv_here:
+            level = "MEDIUM"
+            watch = True
+            if fpv_here and not (heavy_here or reactive):
+                reason = (f"ФПВ курсом на {', '.join(ring[:2])} — це вже "
+                          f"помітна відстань")
+            elif reactive and not heavy_here:
+                reason = f"реактивний шахед курсом на {', '.join(ring[:2])}"
+            else:
+                reason = f"важка зброя курсом на {', '.join(ring[:2])}"
+        else:
+            level, reason = "MEDIUM", f"ціль курсом на {', '.join(ring[:2])}"
 
     elif extra and air and not digest:
         level = "HIGH"
@@ -1403,6 +1447,7 @@ def classify(text: str) -> dict | None:
         # ні, це 40 км. Через це в добовому звіті були зайві «прильоти».
         "impact_zone": bool(zmiiv or close or near
                             or geo.find_home_district(low)),
+        "watch": watch,
         "key": dedup_key(level, places, threat_names, body),
     }
 

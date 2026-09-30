@@ -663,11 +663,6 @@ HEAVY = {"Балістика", "Крилата ракета", "Ракета", "�
 # треба відрізнити його на дальньому «кільці» Мерефа/Чугуїв.
 REACTIVE_RE = re.compile(r"(?<!\w)реактив")
 
-# На дальньому «кільці» (Мерефа/Чугуїв і супутники) звичайний шахед і
-# ланцет майже напевно летять туди ж (чи ще далі) — писати про них
-# нема сенсу. «Реактивний» шахед сюди НЕ входить: то окрема перевірка.
-RING_SKIP = {"Шахед", "Ланцет"}
-
 # Розвідувальні БпЛА не будять: вони дивляться, а не б'ють.
 # FPV сюди НЕ входить: більшість FPV — ударні, це справжня загроза.
 QUIET_TYPES = {"Розвідувальний", "Загроза пуску"}
@@ -1345,19 +1340,44 @@ def classify(text: str) -> dict | None:
         reactive = (any(n == "Шахед" for n in threat_names)
                     and REACTIVE_RE.search(low))
         fpv_here = "FPV" in threat_names
-        # Звичайний шахед/ланцет туди й летить (чи ще далі) — писати
-        # нема сенсу. А ось невідомий/незвичний тип (Молния, просто
-        # «БпЛА» без уточнення) міг раніше давати звичайне тихе
-        # сповіщення — це не чіпаємо, лише важке/ФПВ підсилюємо.
-        skip_only = (threat_names
-                    and all(n in RING_SKIP for n in threat_names)
-                    and not reactive)
-        if skip_only:
+        regular_shahed = "Шахед" in threat_names and not reactive
+        # Скільки саме цілей на ЦІ пункти (а не заголовок зведення по
+        # всій області) — та сама логіка, що й mass_reason нижче.
+        segs = _place_segments(low, ring)
+        count = max((_explicit_count(s) for s in segs), default=0)
+        if not count and (heavy_here or reactive or fpv_here or regular_shahed):
+            count = 1                   # згадка без цифри — це одна ціль
+
+        # Печеніги — найдальше й найтихіше: лише жовта позначка за
+        # важку/реактивну/ФПВ, кількість на червоне не впливає, а
+        # звичайний шахед/ланцет так само пропускаємо повністю.
+        pech_only = ring and all(p == "Печеніги" for p in ring)
+        # Мерефа (25 км) — не так далеко: 5+ важких/реактивних — уже
+        # привід кричати. Решта «кільця» (Чугуїв, Первомайський,
+        # Балаклія, Кочеток тощо) — досить і 2.
+        red_at = 5 if "Мерефа" in ring else 2
+
+        if regular_shahed and not (heavy_here or reactive or fpv_here):
+            # Звичайний шахед/ланцет — майже напевно летить туди ж (чи
+            # ще далі), нема сенсу писати. Виняток — якщо їх декілька:
+            # два звичайних шахеди в одному напрямку вже щось означають.
+            if pech_only or count < 2:
+                return None
+            level, watch = "MEDIUM", True
+            reason = f"{count} шахеди курсом на {', '.join(ring[:2])}"
+        elif "Ланцет" in threat_names and not (heavy_here or reactive
+                                               or fpv_here or regular_shahed):
             return None
-        if heavy_here or reactive or fpv_here:
+        elif heavy_here or reactive or fpv_here:
             level = "MEDIUM"
             watch = True
-            if fpv_here and not (heavy_here or reactive):
+            if not pech_only and count >= red_at:
+                level = "HIGH"
+                kind = "важка зброя" if heavy_here else (
+                    "реактивні шахеди" if reactive else "ФПВ")
+                reason = (f"{count} × {kind} курсом на "
+                         f"{', '.join(ring[:2])} — це вже близько")
+            elif fpv_here and not (heavy_here or reactive):
                 reason = (f"ФПВ курсом на {', '.join(ring[:2])} — це вже "
                           f"помітна відстань")
             elif reactive and not heavy_here:

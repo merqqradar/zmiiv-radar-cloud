@@ -220,6 +220,10 @@ PANEL_HELP = """🎛 <b>Керування радаром</b>
 
 🔎 <b>Кнопка «Оновити»: смарт-режим</b> — увімкнено (типово): кнопка «Оновити» під закріпленим переглядає останні повідомлення каналів і сама вирішує, чи знята ціль. Вимкнено — кнопка просто перемальовує час, як стара версія, без жодного аналізу.
 
+🧠 <b>Розумні фільтри</b> — разом вмикає чи вимикає всі «розумні» перевірки (планові роботи, впевненість, підтвердження двома каналами, контекст відповіді, глибокий розбір списків). Вимикайте лише якщо котрась почала заважати — без них радар повертається до простих правил.
+
+📡 <b>Пильність</b> — наскільки уважно радар стежить за дальнім кільцем (Мерефа, Чугуїв, Первомайський, Балаклія і супутники — Зміїв і ближній круг завжди під повною увагою, цей перемикач їх не чіпає). Базова (типово): кільце в принципі не цікавить — самотня звичайна ціль мовчить, ФПВ і важка зброя (балістика, ракета, КАБ, бандероль) дають тихе жовте, маса шахедів (від 4) теж тихе жовте, червоного там не буває. Розширена: кільце теж може дати червону — важка зброя й ФПВ одразу, шахеди від трьох.
+
 <i>Команди: /panel /pause /resume /mute /report /status /state
 /local /online /restart_cloud
 Кнопки працюють, поки радар запущений.</i>"""
@@ -320,9 +324,9 @@ def format_message(res: dict, channel: str, link: str, dup_src=None) -> str:
         if res["threats"] and not res.get("main_city"):
             # Тип названо — брехати, що його немає, не можна. Насправді
             # невпевненість в іншому: мова не про саме місто.
-            head += ("<i>⚠️ Радар не впевнений: це ціль на сусіднє село, "
-                     "про саме місто в повідомленні не йдеться. Перевірте "
-                     "джерело.</i>\n")
+            head += ("<i>⚠️ Радар не впевнений: це ціль на сусідній "
+                     "населений пункт, про саме місто в повідомленні не "
+                     "йдеться. Перевірте джерело.</i>\n")
         else:
             head += ("<i>⚠️ Радар не впевнений: у повідомленні немає прямої "
                      "згадки міста або типу загрози. Перевірте джерело.</i>\n")
@@ -508,6 +512,7 @@ class Radar:
         self.last_episode_end = None    # коли востаннє завершився епізод особливої небезпеки
         self.moved_away = False         # уже сказали «ціль пішла далі» — не дублювати «минула»
         self._last_msg_id = None        # id останнього надісланого _announce — для ланцюжка відповідей
+        self.alarm_msg_id = None        # id повідомлення «тривога по району» — для відбою в ту саму нитку
         self._wake_reason = None        # чому оновлюємо закріплене
         self.standby = False            # резерв мовчить, поки живий онлайн
         self.mute_until = None          # тиша на годину: звук тимчасово вимкнено
@@ -1277,7 +1282,7 @@ class Radar:
                        data.get("impact_types") or {},
                        data.get("impact_log"), with_place=True)
         lines.append("")
-        lines += block("🟠 Цілей поруч (сусідні села):", data.get("near", 0),
+        lines += block("🟠 Цілей поруч (сусідні населені пункти):", data.get("near", 0),
                        {}, data.get("near_log"), with_place=True)
         lines += ["", f"🟡 Тривог по району: <b>{data.get('alarms', 0)}</b>"]
 
@@ -1360,16 +1365,22 @@ class Radar:
                         await self._announce(format_alarm(kind, now, True,
                                                           src=src))
                         self.announced = "on"
+                        self.alarm_msg_id = self._last_msg_id
                     save_state(self.alarm, self.announced)
                 elif state[0] == "off" and self.alarm:
                     self.alarm = None
                     alarm_changed = True
                     log.info("відбій тривоги по району")
                     if config.ANNOUNCE_ALARM:
+                        # Відповідаємо на своє ж «оголошено» — так у чаті
+                        # видно пару тривога/відбій, а не два непов'язаних
+                        # повідомлення.
                         await self._announce(format_alarm("", now, False,
-                                                          src=src))
+                                                          src=src),
+                                             reply_to=self.alarm_msg_id)
                         self.announced = "off"
                         self.last_alarm_off = now
+                        self.alarm_msg_id = None
                     save_state(None, self.announced)
                 if alarm_changed and self._status_dirty:
                     self._status_dirty.set()
@@ -2013,9 +2024,12 @@ class Radar:
                 near_place = res["places"][0] if res["places"] else "поруч"
                 if self.near_threat and self.near_threat["place"] == near_place:
                     self.near_threat["last_seen"] = now_ts
+                    if sent_msg_id:
+                        self.near_threat["msg_id"] = sent_msg_id
                 else:
                     self.near_threat = {"place": near_place, "since": now_ts,
-                                        "last_seen": now_ts}
+                                        "last_seen": now_ts,
+                                        "msg_id": sent_msg_id}
             if res.get("main_city"):
                 self.last_alert = (datetime.now(), res["level"],
                                    plain_headline(res))
@@ -2524,7 +2538,8 @@ class Radar:
                 notify.control_panel(self.paused, self.is_muted(),
                                      config.FILTER_PLANNED,
                                      config.cloud_active(),
-                                     config.SMART_REVIEW))
+                                     config.SMART_REVIEW,
+                                     config.VIGILANCE))
         elif text.startswith("/mute"):
             self.mute_until = datetime.now() + timedelta(hours=1)
             await asyncio.to_thread(notify.send_to, chat_id,
@@ -2606,7 +2621,8 @@ class Radar:
                 notify.control_panel(self.paused, self.is_muted(),
                                      config.FILTER_PLANNED,
                                      config.cloud_active(),
-                                     config.SMART_REVIEW))
+                                     config.SMART_REVIEW,
+                                     config.VIGILANCE))
         elif action == "mute":
             if self.is_muted():
                 self.mute_until = None
@@ -2619,7 +2635,8 @@ class Radar:
                 notify.control_panel(self.paused, self.is_muted(),
                                      config.FILTER_PLANNED,
                                      config.cloud_active(),
-                                     config.SMART_REVIEW))
+                                     config.SMART_REVIEW,
+                                     config.VIGILANCE))
 
         elif action == "cancel_alarm":
             reply = "⚪️ " + await self.cancel_alarm("з телефона")
@@ -2663,7 +2680,8 @@ class Radar:
                 notify.send_to, chat_id, reply,
                 notify.control_panel(self.paused, self.is_muted(),
                                      config.FILTER_PLANNED,
-                                     config.cloud_active(), new_value))
+                                     config.cloud_active(), new_value,
+                                     config.VIGILANCE))
 
         elif action == "smart":
             # Разом вмикає або вимикає всі розумні фільтри — на випадок,
@@ -2682,7 +2700,28 @@ class Radar:
             await asyncio.to_thread(
                 notify.send_to, chat_id, reply,
                 notify.control_panel(self.paused, self.is_muted(), new_value,
-                                     config.cloud_active(), new_value))
+                                     config.cloud_active(), new_value,
+                                     config.VIGILANCE))
+
+        elif action == "vigilance":
+            # Пильність дальнього кільця (Мерефа, Чугуїв, Первомайський,
+            # Балаклія...) — Зміїв і ближній круг цей перемикач не
+            # зачіпає, вони завжди під повною увагою.
+            saved = settings.load()
+            new_value = "base" if saved.get("vigilance", "base") == "extended" \
+                else "extended"
+            saved["vigilance"] = new_value
+            settings.save(saved)
+            config.reload_settings()
+            reply = ("📡 Пильність: розширена — дальнє кільце теж може "
+                     "дати червону" if new_value == "extended" else
+                     "📡 Пильність: базова — дальнє кільце тихе")
+            await asyncio.to_thread(
+                notify.send_to, chat_id, reply,
+                notify.control_panel(self.paused, self.is_muted(),
+                                     config.FILTER_PLANNED,
+                                     config.cloud_active(),
+                                     config.SMART_REVIEW, new_value))
 
         elif action == "test":
             ok, info = await asyncio.to_thread(

@@ -1340,52 +1340,72 @@ def classify(text: str) -> dict | None:
         reactive = (any(n == "Шахед" for n in threat_names)
                     and REACTIVE_RE.search(low))
         fpv_here = "FPV" in threat_names
-        regular_shahed = "Шахед" in threat_names and not reactive
+        shahed_here = "Шахед" in threat_names
         # Скільки саме цілей на ЦІ пункти (а не заголовок зведення по
         # всій області) — та сама логіка, що й mass_reason нижче.
         segs = _place_segments(low, ring)
         count = max((_explicit_count(s) for s in segs), default=0)
-        if not count and (heavy_here or reactive or fpv_here or regular_shahed):
+        if not count and (heavy_here or shahed_here or fpv_here):
             count = 1                   # згадка без цифри — це одна ціль
 
-        # Печеніги — найдальше й найтихіше: лише жовта позначка за
-        # важку/реактивну/ФПВ, кількість на червоне не впливає, а
-        # звичайний шахед/ланцет так само пропускаємо повністю.
+        # Печеніги — за Чугуєвом: якщо загроза й летить на нас, то через
+        # Чугуїв і його найближчих, а не з-за нього. Тому Печеніги
+        # лишаються найтихішими завжди, на обох рівнях пильності:
+        # жовта позначка за важке/реактивне/ФПВ, і ніколи червоне.
         pech_only = ring and all(p == "Печеніги" for p in ring)
-        # Мерефа (25 км) — не так далеко: 5+ важких/реактивних — уже
-        # привід кричати. Решта «кільця» (Чугуїв, Первомайський,
-        # Балаклія, Кочеток тощо) — досить і 2.
-        red_at = 5 if "Мерефа" in ring else 2
+        extended = config.VIGILANCE == "extended"
+        kind = ("важка зброя" if heavy_here
+               else "ФПВ" if fpv_here
+               else "реактивний шахед" if reactive else "шахед")
 
-        if regular_shahed and not (heavy_here or reactive or fpv_here):
-            # Звичайний шахед/ланцет — майже напевно летить туди ж (чи
-            # ще далі), нема сенсу писати. Виняток — якщо їх декілька:
-            # два звичайних шахеди в одному напрямку вже щось означають.
-            if pech_only or count < 2:
-                return None
-            level, watch = "MEDIUM", True
-            reason = f"{count} шахеди курсом на {', '.join(ring[:2])}"
-        elif "Ланцет" in threat_names and not (heavy_here or reactive
-                                               or fpv_here or regular_shahed):
-            return None
-        elif heavy_here or reactive or fpv_here:
-            level = "MEDIUM"
-            watch = True
-            if not pech_only and count >= red_at:
-                level = "HIGH"
-                kind = "важка зброя" if heavy_here else (
-                    "реактивні шахеди" if reactive else "ФПВ")
-                reason = (f"{count} × {kind} курсом на "
-                         f"{', '.join(ring[:2])} — це вже близько")
-            elif fpv_here and not (heavy_here or reactive):
-                reason = (f"ФПВ курсом на {', '.join(ring[:2])} — це вже "
-                          f"помітна відстань")
-            elif reactive and not heavy_here:
-                reason = f"реактивний шахед курсом на {', '.join(ring[:2])}"
+        if pech_only:
+            if heavy_here or reactive or fpv_here:
+                level, watch = "MEDIUM", True
+                reason = f"{kind} курсом на Печеніги"
             else:
+                return None
+        elif not extended:
+            # БАЗОВИЙ (за замовчуванням): дальнє кільце нас в принципі
+            # не цікавить. Одиночна ціль звичайного типу — не повід
+            # писати. ФПВ — виняток, бо сама його поява там на 25+ км
+            # вже нова інформація. Важка зброя (вона швидка й далекобійна)
+            # — теж завжди варто знати, хоч і тихо. Маса шахедів (від 4) —
+            # привід знати, бо курс може змінитися і на нас.
+            if fpv_here:
+                level, watch = "MEDIUM", True
+                reason = f"ФПВ курсом на {', '.join(ring[:2])}"
+            elif heavy_here:
+                level, watch = "MEDIUM", True
                 reason = f"важка зброя курсом на {', '.join(ring[:2])}"
+            elif shahed_here and count >= 4:
+                level, watch = "MEDIUM", True
+                reason = f"{count} шахедів курсом на {', '.join(ring[:2])}"
+            elif threat_names and not (shahed_here or "Ланцет" in threat_names
+                                       or "Розвідувальний" in threat_names):
+                # Невідомий/нетиповий тип (Молния, просто «БпЛА» без
+                # уточнення) — не підпадає під жодне з правил вище явно,
+                # тож просто тиха згадка, як і раніше.
+                level, reason = "MEDIUM", f"ціль курсом на {', '.join(ring[:2])}"
+            else:
+                return None
         else:
-            level, reason = "MEDIUM", f"ціль курсом на {', '.join(ring[:2])}"
+            # РОЗШИРЕНИЙ: важка зброя і ФПВ — одразу червоним (вони
+            # швидкі, чекати кількості небезпечно). Шахеди — 1-2 жовтим,
+            # 3+ червоним.
+            if heavy_here or fpv_here:
+                level = "HIGH"
+                watch = True
+                reason = f"{kind} курсом на {', '.join(ring[:2])}"
+            elif shahed_here:
+                level = "HIGH" if count > 2 else "MEDIUM"
+                watch = True
+                reason = (f"{count} × {kind} курсом на {', '.join(ring[:2])}"
+                         if count > 1 else f"{kind} курсом на {', '.join(ring[:2])}")
+            elif threat_names and not ("Ланцет" in threat_names
+                                       or "Розвідувальний" in threat_names):
+                level, reason = "MEDIUM", f"ціль курсом на {', '.join(ring[:2])}"
+            else:
+                return None
 
     elif extra and air and not digest:
         level = "HIGH"
@@ -1412,7 +1432,11 @@ def classify(text: str) -> dict | None:
         confidence = "low"          # зведення — це ретроспектива, не факт
     elif zmiiv and found:
         confidence = "high"
-    elif (zmiiv and course) or (close and air):
+    elif (zmiiv and course) or (close and air) or ((near or far) and threat_names):
+        # Дальнє кільце без визначеного типу зброї раніше взагалі не
+        # доходило сюди (гілка повертала None), тож якщо ми тут — тип
+        # названо явно, і «низька впевненість» (а з нею й тиша для
+        # «розширеного» червоного) тут не на місці.
         confidence = "medium"
     else:
         confidence = "low"

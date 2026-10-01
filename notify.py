@@ -110,7 +110,8 @@ REFRESH_BUTTON = {"inline_keyboard": [[{"text": "🔄 Оновити",
 # Панель управления в личной переписке с ботом. Доступна только владельцу.
 def control_panel(paused: bool, muted: bool = False,
                   smart: bool = True, online: bool = False,
-                  smart_button: bool = True) -> dict:
+                  smart_button: bool = True,
+                  vigilance: str = "base") -> dict:
     """Панель управления в личной переписке. Доступна только владельцу.
 
     online — де зараз активна робота: True — на хмарі (Онлайн),
@@ -118,6 +119,8 @@ def control_panel(paused: bool, muted: bool = False,
     smart_button — чи кнопка «Оновити» під закріпленим робить повний
     смарт-огляд каналів, чи просто перемальовує час (окремо від
     загального перемикача «Розумні фільтри» нижче).
+    vigilance — "base" (дальнє кільце мовчить, крім ФПВ/важкої/маси) чи
+    "extended" (дальнє кільце теж може дати червону).
     """
     return {"inline_keyboard": [
         # Найперша кнопка: коли радар помилково підняв червону тривогу,
@@ -144,6 +147,10 @@ def control_panel(paused: bool, muted: bool = False,
         [{"text": "🧠 Розумні фільтри: увімк" if smart
                   else "⚠️ Розумні фільтри: ВИМК",
           "callback_data": "ctl:smart"}],
+        [{"text": "📡 Пильність: розширена (Мерефа/Чугуїв теж червоні)"
+                  if vigilance == "extended" else
+                  "📡 Пильність: базова (дальнє кільце тихо)",
+          "callback_data": "ctl:vigilance"}],
         [{"text": "✅ Перевірка зв'язку", "callback_data": "ctl:test"}],
     ]}
 
